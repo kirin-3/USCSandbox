@@ -17,6 +17,8 @@ namespace USCSandbox
                 Console.WriteLine("  [shader path id (or --all to load all shaders)]");
                 Console.WriteLine("  --platform <[d3d11, Switch] (or skip this arg for d3d11)>");
                 Console.WriteLine("  --version <unity version override>");
+                Console.WriteLine("  --skip <file of shader names, one per line, not to decompile>");
+                Console.WriteLine("  --only <file of shader path ids, one per line; with --all, decompile only these>");
                 return;
             }
 
@@ -26,6 +28,8 @@ namespace USCSandbox
             GPUPlatform platform = GPUPlatform.d3d11;
             UnityVersion? ver = null;
             bool allSet = false;
+            HashSet<string> skip = [];
+            HashSet<long>? only = null;
 
             List<string> argList = [];
             for (var i = 0; i < args.Length; i++)
@@ -43,6 +47,14 @@ namespace USCSandbox
                             break;
                         case "--all":
                             allSet = true;
+                            break;
+                        case "--skip":
+                            // Newline-separated shader names another source provides.
+                            skip = [.. File.ReadAllLines(args[++i]).Select(line => line.Trim()).Where(line => line.Length > 0)];
+                            break;
+                        case "--only":
+                            // Newline-separated path ids: one process's share of the shaders.
+                            only = [.. File.ReadAllLines(args[++i]).Select(line => line.Trim()).Where(line => line.Length > 0).Select(long.Parse)];
                             break;
                         default:
                             Console.WriteLine($"Optional argmuent {arg} is invalid.");
@@ -151,7 +163,8 @@ namespace USCSandbox
             if (shaderPathId != 0)
                 shadersToLoad.Add(afileInst.file.GetAssetInfo(shaderPathId));
             else
-                shadersToLoad.AddRange(afileInst.file.GetAssetsOfType(AssetClassID.Shader));
+                shadersToLoad.AddRange(afileInst.file.GetAssetsOfType(AssetClassID.Shader)
+                    .Where(info => only is null || only.Contains(info.PathId)));
 
             foreach (var shaderInf in shadersToLoad)
             {
@@ -159,16 +172,29 @@ namespace USCSandbox
                 if (shaderBf == null)
                 {
                     Console.WriteLine("Shader asset not found or couldn't be read.");
-                    return;
+                    continue;
                 }
 
                 var shaderName = shaderBf["m_ParsedForm"]["m_Name"].AsString;
-                var shaderProcessor = new ShaderProcessor(shaderBf, ver.Value, platform);
-                string shaderText = shaderProcessor.Process();
+                if (skip.Contains(shaderName))
+                {
+                    Console.WriteLine($"{shaderName} skipped");
+                    continue;
+                }
+                // One bad shader must not end the run for the rest of the file.
+                try
+                {
+                    var shaderProcessor = new ShaderProcessor(shaderBf, ver.Value, platform);
+                    string shaderText = shaderProcessor.Process();
 
-                Directory.CreateDirectory(Path.Combine(Environment.CurrentDirectory, "out", Path.GetDirectoryName(shaderName)!));
-                File.WriteAllText($"{Path.Combine(Environment.CurrentDirectory, "out", shaderName)}.shader", shaderText);
-                Console.WriteLine($"{shaderName} decompiled");
+                    Directory.CreateDirectory(Path.Combine(Environment.CurrentDirectory, "out", Path.GetDirectoryName(shaderName)!));
+                    File.WriteAllText($"{Path.Combine(Environment.CurrentDirectory, "out", shaderName)}.shader", shaderText);
+                    Console.WriteLine($"{shaderName} decompiled");
+                }
+                catch (Exception error)
+                {
+                    Console.WriteLine($"{shaderName} failed: {error.GetType().Name}: {error.Message.ReplaceLineEndings(" ")}");
+                }
             }
         }
     }

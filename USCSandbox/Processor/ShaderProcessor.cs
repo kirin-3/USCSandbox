@@ -65,11 +65,6 @@ namespace USCSandbox.Processor
             lz4Decoder.Dispose();
 
             var blobManager = new BlobManager(decompressedBlob, _engVer);
-            for (var i = 0; i < blobManager.Entries.Count; i++)
-            {
-                var entryBytes = blobManager.GetRawEntry(i);
-                File.WriteAllBytes($"dbg_entry_{i}.bin", entryBytes);
-            }
 
             _sb.AppendLine($"Shader \"{name}\" {{");
             _sb.Indent();
@@ -112,8 +107,9 @@ namespace USCSandbox.Processor
                 .ToList();
 
             var subPrograms = basketsInfo.Select(x => x.subProg).ToList();
-            ShaderGpuProgramType[] vertTypes = [ShaderGpuProgramType.DX11VertexSM40, ShaderGpuProgramType.ConsoleVS];
-            ShaderGpuProgramType[] fragTypes = [ShaderGpuProgramType.DX11PixelSM40, ShaderGpuProgramType.ConsoleFS];
+            // VRC recovery patch: SM5.0 programs (#pragma target 5.0) share the SM4.0 path.
+            ShaderGpuProgramType[] vertTypes = [ShaderGpuProgramType.DX11VertexSM40, ShaderGpuProgramType.DX11VertexSM50, ShaderGpuProgramType.ConsoleVS];
+            ShaderGpuProgramType[] fragTypes = [ShaderGpuProgramType.DX11PixelSM40, ShaderGpuProgramType.DX11PixelSM50, ShaderGpuProgramType.ConsoleFS];
             var firstVert = subPrograms.FirstOrDefault(x => vertTypes.Contains(x.GetProgramType(_engVer)));
             var firstFrag = subPrograms.FirstOrDefault(x => fragTypes.Contains(x.GetProgramType(_engVer)));
             
@@ -204,7 +200,6 @@ namespace USCSandbox.Processor
                 var index = basket.index;
 
                 var subProg = blobManager.GetShaderSubProgram((int)subProgInfo.BlobIndex);
-                File.WriteAllBytes($"dbg_entry_data_{subProgInfo.BlobIndex}.bin", subProg.ProgramData);
 
                 ShaderParams param;
                 if (index != -1)
@@ -219,6 +214,9 @@ namespace USCSandbox.Processor
                 param.CombineCommon(progInfo);
 
                 var programType = subProg.GetProgramType(_engVer);
+                // VRC recovery patch: decompile SM5.0 exactly like SM4.0 (same DXBC reader, SHEX chunk).
+                if (programType == ShaderGpuProgramType.DX11VertexSM50) programType = ShaderGpuProgramType.DX11VertexSM40;
+                if (programType == ShaderGpuProgramType.DX11PixelSM50) programType = ShaderGpuProgramType.DX11PixelSM40;
                 var graphicApi = _platformId;
 
                 var keywords = subProg.GlobalKeywords.Concat(subProg.LocalKeywords).Order().ToArray();
@@ -583,6 +581,11 @@ namespace USCSandbox.Processor
 
                     var vertProgInfos = vertInfo.GetForPlatform((int)GetVertexProgramForPlatform(_platformId));
                     var fragProgInfos = fragInfo.GetForPlatform((int)GetFragmentProgramForPlatform(_platformId));
+                    // VRC recovery patch: a pass built with #pragma target 5.0 has only SM5.0 programs.
+                    if (_platformId == GPUPlatform.d3d11 && vertProgInfos.Count == 0)
+                        vertProgInfos = vertInfo.GetForPlatform((int)ShaderGpuProgramType.DX11VertexSM50);
+                    if (_platformId == GPUPlatform.d3d11 && fragProgInfos.Count == 0)
+                        fragProgInfos = fragInfo.GetForPlatform((int)ShaderGpuProgramType.DX11PixelSM50);
                     
                     // we should hopefully only have one of each type, but just in case...
                     // todo: cleanup
