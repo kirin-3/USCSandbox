@@ -34,6 +34,8 @@ copy Files\classdata.tpk out\
 copy readme.md out\
 ```
 
-`out\` then gets a `SOURCE.txt` naming the source tag and stating that upstream publishes no license, and its contents are zipped (files at the zip root) as `USCSandbox-vrcw-1-win-x64.zip`. `USCSandbox.exe` reads `classdata.tpk` from its working directory.
+`out\` then got a `SOURCE.txt` naming the source tag, and its contents were zipped (files at the zip root) as `USCSandbox-vrcw-1-win-x64.zip`. `USCSandbox.exe` reads `classdata.tpk` from its working directory.
 
-The source of release `vrcw-1` is tag [`vrcw-1`](https://github.com/kirin-3/USCSandbox/tree/vrcw-1).
+Release `vrcw-2` changes no code. Tag `vrcw-2` adds upstream's GPL-3.0 `license` (merged from upstream `044bc319`) and this file. Its zip is the `vrcw-1` zip with `license` and the tag's `readme.md` added and `SOURCE.txt` rewritten; every other file is byte-identical to `vrcw-1`, so the binaries are the ones VRCW validated. (A rebuild gives the same code but a different `USCSandbox.dll` hash, because the build path is embedded.)
+
+The source of release `vrcw-2` is tag [`vrcw-2`](https://github.com/kirin-3/USCSandbox/tree/vrcw-2).
