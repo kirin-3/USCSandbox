@@ -4,7 +4,7 @@ This branch is a modified version of [USCSandbox](https://github.com/nesrak1/USC
 
 ## License
 
-**Upstream publishes no license**, and this fork adds none. Nothing here grants any rights beyond what the upstream author grants. The upstream repository is https://github.com/nesrak1/USCSandbox.
+USCSandbox is licensed under the GNU General Public License v3.0 (see `license`), which upstream added in [`044bc319`](https://github.com/nesrak1/USCSandbox/commit/044bc319866ca2f7a570942cb55d74458de7e2c0). This fork and its releases are distributed under the same license. The upstream repository is https://github.com/nesrak1/USCSandbox.
 
 ## Base
 
