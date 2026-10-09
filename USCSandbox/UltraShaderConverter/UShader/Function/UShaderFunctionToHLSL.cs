@@ -699,8 +699,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
 
         private void HandleSampleCountInfo(USILInstruction inst)
         {
-            List<USILOperand> srcOps = inst.srcOperands;
-            string value = $"{srcOps[0]} = GetRenderTargetSampleCount()";
+            string value = $"{inst.destOperand} = GetRenderTargetSampleCount()";
             string comment = CommentString(inst);
             AppendLine($"{comment}{value};");
         }

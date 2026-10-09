@@ -194,6 +194,10 @@ namespace USCSandbox
                 catch (Exception error)
                 {
                     Console.WriteLine($"{shaderName} failed: {error.GetType().Name}: {error.Message.ReplaceLineEndings(" ")}");
+                    // The whole exception, framed so VRCW can attach it to this shader's result.
+                    Console.Error.WriteLine($"--- VRCW stack begin: {shaderName}");
+                    Console.Error.WriteLine(error.ToString());
+                    Console.Error.WriteLine("--- VRCW stack end");
                 }
             }
         }

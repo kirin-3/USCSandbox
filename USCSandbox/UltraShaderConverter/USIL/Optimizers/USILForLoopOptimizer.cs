@@ -84,7 +84,14 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Optimizer
 
                 if (endOpcodesMatch)
                 {
-                    if (loopInfos.Count > 0 && loopInfos.Peek().loopDepth == loopDepth - 1)
+                    // A loop that steps by a register, not a constant, is no counted for loop: it stays a plain loop.
+                    USILOperand step = insts[i].srcOperands[1];
+                    bool constantStep = insts[i].isIntVariant ? step.immValueInt is { Length: > 0 } : step.immValueFloat is { Length: > 0 };
+                    if (!constantStep && loopInfos.Count > 0 && loopInfos.Peek().loopDepth == loopDepth - 1)
+                    {
+                        loopInfos.Pop();
+                    }
+                    else if (loopInfos.Count > 0 && loopInfos.Peek().loopDepth == loopDepth - 1)
                     {
                         LoopInstanceInfo loopInfo = loopInfos.Pop();
 

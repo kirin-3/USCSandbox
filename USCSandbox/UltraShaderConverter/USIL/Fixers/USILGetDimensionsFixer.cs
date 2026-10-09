@@ -35,11 +35,12 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Fixers
                     continue;
                 }
 
-                USILInstruction resinfoInst = instructions[0];
-                USILInstruction sampleinfoInst = instructions[1];
+                USILInstruction resinfoInst = instructions[i];
+                USILInstruction sampleinfoInst = instructions[i + 1];
 
-                // needed? (did I even get the right registers?)
-                if (resinfoInst.srcOperands[1].registerIndex != sampleinfoInst.srcOperands[0].registerIndex)
+                // needed? (did I even get the right registers?) A rasterizer sampleinfo names no resource.
+                if (sampleinfoInst.srcOperands[0].operandType == USILOperandType.Null
+                    || resinfoInst.srcOperands[1].registerIndex != sampleinfoInst.srcOperands[0].registerIndex)
                 {
                     continue;
                 }

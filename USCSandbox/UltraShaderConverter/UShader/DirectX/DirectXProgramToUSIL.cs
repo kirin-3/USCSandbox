@@ -1761,7 +1761,11 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
             USILOperand usilSrc0 = new USILOperand();
 
             FillUSILOperand(dest, usilDest, dest.swizzle, false);
-            FillUSILOperand(src0, usilSrc0, src0.swizzle, false);
+            // `sampleinfo dest, rasterizer` reads the render target's sample count: no resource to name.
+            if (src0.operand == Operand.Rasterizer)
+                usilSrc0.operandType = USILOperandType.Null;
+            else
+                FillUSILOperand(src0, usilSrc0, src0.swizzle, false);
 
             usilInst.instructionType = USILInstructionType.SampleCountInfo;
             usilInst.destOperand = usilDest;

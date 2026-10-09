@@ -5,28 +5,30 @@ namespace USCSandbox.Processor
 {
     public class BlobManager
     {
-        private AssetsFileReader _reader;
+        private List<byte[]> _segments;
         private UnityVersion _engVer;
 
         public List<BlobEntry> Entries;
 
-        public BlobManager(byte[] blob, UnityVersion engVer)
+        // The entry table is at the start of the first segment; each entry points into its own segment.
+        public BlobManager(List<byte[]> segments, UnityVersion engVer)
         {
-            _reader = new AssetsFileReader(new MemoryStream(blob));
+            _segments = segments;
             _engVer = engVer;
 
-            var count = _reader.ReadInt32();
+            var reader = new AssetsFileReader(new MemoryStream(segments[0]));
+            var count = reader.ReadInt32();
             Entries = new List<BlobEntry>(count);
             for (var i = 0; i < count; i++)
             {
-                Entries.Add(new BlobEntry(_reader, engVer));
+                Entries.Add(new BlobEntry(reader, engVer));
             }
         }
 
         public byte[] GetRawEntry(int index)
         {
-            _reader.BaseStream.Position = Entries[index].Offset;
-            return _reader.ReadBytes(Entries[index].Length);
+            var entry = Entries[index];
+            return _segments[entry.Segment].AsSpan(entry.Offset, entry.Length).ToArray();
         }
 
         public ShaderParams GetShaderParams(int index)

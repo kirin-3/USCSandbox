@@ -40,31 +40,23 @@ namespace USCSandbox.Processor
             var compressedBlob = _shaderBf["compressedBlob.Array"].AsByteArray;
 
             var selectedIndex = platforms.IndexOf((int)_platformId);
-            
-            uint selectedOffset;
-            if (offsets[selectedIndex].Children.Count > 0)
-                selectedOffset = offsets[selectedIndex]["Array"][0].AsUInt;
-            else
-                selectedOffset = offsets[selectedIndex].AsUInt;
-            
-            uint selectedCompressedLength;
-            if (compressedLengths[selectedIndex].Children.Count > 0)
-                selectedCompressedLength = compressedLengths[selectedIndex]["Array"][0].AsUInt;
-            else
-                selectedCompressedLength = compressedLengths[selectedIndex].AsUInt;
-            
-            uint selectedDecompressedLength;
-            if (offsets[selectedIndex].Children.Count > 0)
-                selectedDecompressedLength = decompressedLengths[selectedIndex]["Array"][0].AsUInt;
-            else
-                selectedDecompressedLength = decompressedLengths[selectedIndex].AsUInt;
 
-            var decompressedBlob = new byte[selectedDecompressedLength];
-            var lz4Decoder = new Lz4DecoderStream(new MemoryStream(compressedBlob));
-            lz4Decoder.Read(decompressedBlob, 0, (int)selectedDecompressedLength);
-            lz4Decoder.Dispose();
+            // Since 2019.3 a platform's programs can span several separately compressed segments, and each blob entry
+            // names its segment. Reading only the first one ran off its end for large shaders (Lit, Uber, Bakery).
+            var segmented = offsets[selectedIndex].Children.Count > 0;
+            var segmentCount = segmented ? offsets[selectedIndex]["Array"].Children.Count : 1;
+            uint At(AssetTypeValueField field, int segment) => segmented ? field[selectedIndex]["Array"][segment].AsUInt : field[selectedIndex].AsUInt;
+            var segments = new List<byte[]>(segmentCount);
+            for (var segment = 0; segment < segmentCount; segment++)
+            {
+                var decompressed = new byte[At(decompressedLengths, segment)];
+                using var lz4Decoder = new Lz4DecoderStream(new MemoryStream(compressedBlob, (int)At(offsets, segment), (int)At(compressedLengths, segment)));
+                // A single Read can return less than asked for.
+                lz4Decoder.ReadExactly(decompressed);
+                segments.Add(decompressed);
+            }
 
-            var blobManager = new BlobManager(decompressedBlob, _engVer);
+            var blobManager = new BlobManager(segments, _engVer);
 
             _sb.AppendLine($"Shader \"{name}\" {{");
             _sb.Indent();
