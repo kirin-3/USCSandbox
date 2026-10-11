@@ -15,7 +15,21 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Fixers
             "unity_ShadowMask",
             "unity_DynamicLightmap",
             "unity_SpecCube0",
-            "unity_ProbeVolumeSH"
+            "unity_ProbeVolumeSH",
+            // declared without a sampler of their own: they sample with another texture's (see SamplerOf)
+            "unity_SpecCube1",
+            "unity_LightmapInd",
+            "unity_DynamicDirectionality",
+            "unity_DynamicNormal"
+        };
+
+        // UNITY_DECLARE_TEX*_NOSAMPLER textures of UnityShaderVariables.cginc and the texture whose sampler they use
+        public static readonly Dictionary<string, string> SHARED_SAMPLER_TEXTURE_NAMES = new()
+        {
+            { "unity_SpecCube1", "unity_SpecCube0" },
+            { "unity_LightmapInd", "unity_Lightmap" },
+            { "unity_DynamicDirectionality", "unity_DynamicLightmap" },
+            { "unity_DynamicNormal", "unity_DynamicLightmap" }
         };
 
         public bool Run(UShaderProgram shader, ShaderParams shaderParams)

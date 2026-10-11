@@ -30,6 +30,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Optimizer
         {
             bool changes = false;
             Stack<LoopInstanceInfo> loopInfos = new Stack<LoopInstanceInfo>();
+            List<LoopInstanceInfo> started = new List<LoopInstanceInfo>();
 
             int loopDepth = 0;
 
@@ -44,7 +45,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Optimizer
                     if (loopInfos.Count > 0 && loopInfos.Peek().loopDepth == loopDepth)
                     {
                         // didn't match and we're exiting this loop now
-                        loopInfos.Pop();
+                        loopInfos.Pop().RevertIterNames();
                     }
                 }
 
@@ -75,6 +76,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Optimizer
 
                         LoopInstanceInfo loopInfo = new LoopInstanceInfo(iterRegOp, compOp, compType, isInt, isUnsigned, i, loopDepth);
                         loopInfos.Push(loopInfo);
+                        started.Add(loopInfo);
                     }
                 }
 
@@ -89,11 +91,12 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Optimizer
                     bool constantStep = insts[i].isIntVariant ? step.immValueInt is { Length: > 0 } : step.immValueFloat is { Length: > 0 };
                     if (!constantStep && loopInfos.Count > 0 && loopInfos.Peek().loopDepth == loopDepth - 1)
                     {
-                        loopInfos.Pop();
+                        loopInfos.Pop().RevertIterNames();
                     }
                     else if (loopInfos.Count > 0 && loopInfos.Peek().loopDepth == loopDepth - 1)
                     {
                         LoopInstanceInfo loopInfo = loopInfos.Pop();
+                        loopInfo.converted = true;
 
                         int startIndex = loopInfo.startIndex;
                         USILInstruction forLoopInst = insts[startIndex];
@@ -168,6 +171,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Optimizer
                                     break;
                                 }
 
+                                loopInfo.RememberRenamed(op);
                                 op.metadataName = USILConstants.ITER_CHARS[loopInfo.loopDepth].ToString();
                                 op.metadataNameAssigned = true;
 
@@ -182,6 +186,15 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Optimizer
                     loopDepth++;
                 }
             }
+            // A loop that did not become a for loop declares no counter: whatever was named after it gets its register back.
+            foreach (LoopInstanceInfo info in started)
+            {
+                if (!info.converted)
+                {
+                    info.RevertIterNames();
+                }
+            }
+
             return changes;
         }
 
@@ -333,6 +346,29 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Optimizer
             public bool isUnsigned;
             public int startIndex;
             public int loopDepth;
+            public bool converted;
+            // Operands named after this loop's counter. A loop that stays a plain loop declares no counter, so they get their registers back.
+            private readonly List<(USILOperand op, bool metadataNameAssigned, string? metadataName, bool displayMask)> renamed = new();
+
+            public void RememberRenamed(USILOperand op)
+            {
+                renamed.Add((op, op.metadataNameAssigned, op.metadataName, op.displayMask));
+            }
+
+            public void RevertIterNames()
+            {
+                string iterName = USILConstants.ITER_CHARS[loopDepth].ToString();
+                foreach (var (op, assigned, name, displayMask) in renamed)
+                {
+                    if (op.metadataNameAssigned && op.metadataName == iterName)
+                    {
+                        op.metadataNameAssigned = assigned;
+                        op.metadataName = name;
+                        op.displayMask = displayMask;
+                    }
+                }
+                renamed.Clear();
+            }
 
             public LoopInstanceInfo(
                 USILOperand iterRegOp, USILOperand compOp, USILInstructionType compType,

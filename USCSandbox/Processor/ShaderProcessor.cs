@@ -164,6 +164,13 @@ namespace USCSandbox.Processor
                 defineSb.Append(new string(' ', depth * 4));
                 defineSb.AppendLine($"#pragma shader_feature {keyword}");
             }
+
+            // Programs built for shader model 5.0 can use instructions and outputs (SV_Coverage) that ps_4_0 does not have.
+            if (subPrograms.Any(x => x.GetProgramType(_engVer) is ShaderGpuProgramType.DX11VertexSM50 or ShaderGpuProgramType.DX11PixelSM50))
+            {
+                defineSb.Append(new string(' ', depth * 4));
+                defineSb.AppendLine("#pragma target 5.0");
+            }
             
             bool encounterdVert = false;
             bool encounterdFrag = false;
@@ -273,6 +280,15 @@ namespace USCSandbox.Processor
                         conv.ApplyMetadataToProgram(subProg, param, _engVer);
 
                         UShaderFunctionToHLSL hlslConverter = new UShaderFunctionToHLSL(conv.ShaderProgram!, depth);
+
+                        // Textures this program only calls methods on (Load, GetDimensions) are Texture objects; sampler2D has no methods.
+                        foreach (string loadedName in hlslConverter.GetTextureObjectNames())
+                        {
+                            texSb.Replace($"sampler2D {loadedName};", $"Texture2D<float4> {loadedName};");
+                            texSb.Replace($"sampler3D {loadedName};", $"Texture3D<float4> {loadedName};");
+                            texSb.Replace($"samplerCUBE {loadedName};", $"TextureCube<float4> {loadedName};");
+                        }
+                        texSb.Append(hlslConverter.WriteUnnamedDeclarations(declaredCBufs[string.Join("-", keywords)], depth));
                         
                         structSb.AppendLine();
                         codeSb.AppendLine();
@@ -367,14 +383,14 @@ namespace USCSandbox.Processor
                         if (param.ArraySize > 0)
                         {
                             sb.Append(new string(' ', depth * 4));
-                            if (nonGlobalCbuffer)
+                            if (nonGlobalCbuffer && DeclaredByUnityIncludes(cbuffer.Name))
                                 sb.Append("// ");
                             sb.AppendLine($"{typeName} {name}[{param.ArraySize}]; // {param.Index} (starting at cb{cbufferIndex}[{param.Index / 16}].{chars[param.Index % 16 / 4]})");
                         }
                         else
                         {
                             sb.Append(new string(' ', depth * 4));
-                            if (nonGlobalCbuffer && !cbuffer.Name.StartsWith("UnityPerDrawSprite"))
+                            if (nonGlobalCbuffer && DeclaredByUnityIncludes(cbuffer.Name))
                                 sb.Append("// ");
                             sb.AppendLine($"{typeName} {name}; // {param.Index} (starting at cb{cbufferIndex}[{param.Index / 16}].{chars[param.Index % 16 / 4]})");
                         }
@@ -389,9 +405,50 @@ namespace USCSandbox.Processor
                         wroteCbufferHeaderYet = true;
                     }
                 }
+
+                // Struct parameters (unity_Builtins0Array, from UnityInstancing.cginc's instanced buffers) are named in code as
+                // name.member. Their cbuffers are not built in, so the struct is declared here.
+                if (!DeclaredByUnityIncludes(cbuffer.Name))
+                {
+                    List<StructParameter> structs = cbuffer.StructParams.Where(p => !declaredCBufs.Contains(p.Name)).ToList();
+                    string pad = new string(' ', depth * 4);
+                    if (structs.Count > 0)
+                    {
+                        // Unity only accepts struct variables in an instancing cbuffer, written as UNITY_INSTANCING_BUFFER_START does:
+                        // an anonymous struct and an array of it. Decompiled code names the members of the one struct (name.member),
+                        // so the first instance is defined under that name.
+                        sb.AppendLine(pad + "CBUFFER_START(" + cbuffer.Name + ")");
+                        foreach (StructParameter structParam in structs)
+                        {
+                            declaredCBufs.Add(structParam.Name);
+                            sb.AppendLine(pad + "    struct");
+                            sb.AppendLine(pad + "    {");
+                            foreach (ConstantBufferParameter member in structParam.CBParams)
+                            {
+                                string memberName = member.ParamName.StartsWith(structParam.Name + ".", StringComparison.Ordinal)
+                                    ? member.ParamName.Substring(structParam.Name.Length + 1)
+                                    : member.ParamName;
+                                string suffix = member.ArraySize > 0 ? "[" + member.ArraySize + "]" : "";
+                                sb.AppendLine(pad + "        " + DXShaderNamingUtils.GetConstantBufferParamTypeName(member) + " " + memberName + suffix + ";");
+                            }
+                            sb.AppendLine(pad + "    } " + structParam.Name + "_Instances[" + Math.Max(structParam.ArraySize, 1) + "]; // struct parameter, " + structParam.Size + " bytes");
+                        }
+                        sb.AppendLine(pad + "CBUFFER_END");
+                        foreach (StructParameter structParam in structs)
+                        {
+                            sb.AppendLine(pad + "#define " + structParam.Name + " " + structParam.Name + "_Instances[0]");
+                        }
+                    }
+                }
             }
             return sb.ToString();
         }
+
+        // A non-global cbuffer is commented out only when UnityShaderVariables.cginc, which every program gets, declares its variables.
+        // Any other cbuffer is the shader's own (UnityPerMaterial, a custom CBUFFER, UnityDrawCallInfo from UnityInstancing.cginc,
+        // UnityPerDrawSprite from UnitySprites.cginc): decompiled code includes neither file, so its variables are declared.
+        private static bool DeclaredByUnityIncludes(string cbufferName) =>
+            UnityShaderConstants.BUILTIN_CBUFFER_NAMES.Contains(cbufferName);
 
         private string WritePassTextures(
             ShaderParams shaderParams, HashSet<string> declaredCBufs, int depth)
@@ -498,8 +555,9 @@ namespace USCSandbox.Processor
                     SerializedPropertyType.Color or
                     SerializedPropertyType.Vector => $"({defValues[0]}, {defValues[1]}, {defValues[2]}, {defValues[3]})",
                     SerializedPropertyType.Float or
-                    SerializedPropertyType.Range or
-                    SerializedPropertyType.Int => defValues[0],
+                    SerializedPropertyType.Range => defValues[0],
+                    // An Int property keeps its integer in the float's bits: 1 reads as 1E-45, which ShaderLab does not parse.
+                    SerializedPropertyType.Int => BitConverter.SingleToInt32Bits(prop["m_DefValue[0]"].AsFloat).ToString(CultureInfo.InvariantCulture),
                     SerializedPropertyType.Texture => $"\"{defTextureName}\" {{}}",
                     _ => throw new NotSupportedException("Bad property type")
                 };

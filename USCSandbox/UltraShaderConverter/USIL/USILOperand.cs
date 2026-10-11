@@ -20,6 +20,8 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL
 
         public string? metadataName;
         public bool metadataNameAssigned;
+        // a ResourceRegister that reflection names as a buffer (ShaderParams.Buffers), not a texture
+        public bool bufferResource;
         public bool metadataNameWithArray;
 
         public string comment = string.Empty;
@@ -235,7 +237,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL
                         {
                             // todo: check if number can't possibly be expressed as float and write in hex.
                             // todo: float precision isn't correct atm. add precision check somewhere.
-                            body = $"{immValueFloat[0].ToString("0.0#######", CultureInfo.InvariantCulture)}";
+                            body = $"{FloatLiteral(immValueFloat[0])}";
                         }
                         else
                         {
@@ -245,11 +247,11 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL
                             {
                                 if (i != immValueFloat.Length - 1)
                                 {
-                                    body += $"{immValueFloat[i].ToString("0.0#######", CultureInfo.InvariantCulture)}, ";
+                                    body += $"{FloatLiteral(immValueFloat[i])}, ";
                                 }
                                 else
                                 {
-                                    body += $"{immValueFloat[i].ToString("0.0#######", CultureInfo.InvariantCulture)}";
+                                    body += $"{FloatLiteral(immValueFloat[i])}";
                                 }
                             }
                             body += ")";
@@ -344,6 +346,15 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL
             }
 
             return $"{prefix}{body}{suffix}";
+        }
+
+        // HLSL has no literal for infinity or NaN, and float.ToString writes them as "Infinity" and "NaN".
+        public static string FloatLiteral(float value)
+        {
+            if (float.IsPositiveInfinity(value)) return "asfloat(0x7f800000)";
+            if (float.IsNegativeInfinity(value)) return "asfloat(0xff800000)";
+            if (float.IsNaN(value)) return "asfloat(0x7fc00000)";
+            return value.ToString("0.0#######", CultureInfo.InvariantCulture);
         }
 
         public static string GetTypeShortForm(USILOperandType operandType)

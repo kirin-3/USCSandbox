@@ -58,7 +58,12 @@
             "_WorldSpaceLightPos0",
             "_ZBufferParams",
             "_LightPositionRange",
-            "_PPLAmbient"
+            "_PPLAmbient",
+            // UnityShaderVariables.cginc declares these (the camera variables) in every program
+            "unity_OrthoParams",
+            "unity_CameraProjection",
+            "unity_WorldToCamera",
+            "unity_StereoWorldToCamera"
         };
 
         // not in cgincludes but needed

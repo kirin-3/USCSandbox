@@ -9,6 +9,7 @@
         Subtract, //dx: --- (add/iadd)
         Multiply, //dx: mul/imul
         Divide, //dx: div
+        Modulus, //dx: udiv (the remainder output)
         MultiplyAdd, //dx: mad
 
         And, //dx: and

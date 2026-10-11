@@ -21,6 +21,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
         private Dictionary<Opcode, InstHandler> _instructionHandlers;
 
         private Dictionary<int, ResourceDimension> _resourceToDimension;
+        private Dictionary<int, int> _resourceToStride = new();
 
         public DirectXProgramToUSIL(DirectXCompiledShader dxShader)
         {
@@ -118,6 +119,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
                 ////dec
                 { Opcode.dcl_temps, new InstHandler(HandleTemps) },
                 { Opcode.dcl_resource, new InstHandler(HandleResource) },
+                { Opcode.dcl_resource_structured, new InstHandler(HandleResourceStructured) },
                 { Opcode.customdata, new InstHandler(HandleCustomData) }
             };
 
@@ -672,6 +674,12 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
 
         private void HandleDiv(SHDRInstruction inst)
         {
+            if (inst.opcode == Opcode.udiv)
+            {
+                HandleUDiv(inst);
+                return;
+            }
+
             SHDRInstructionOperand dest = inst.operands[0]; // The result of the operation.
             SHDRInstructionOperand src0 = inst.operands[1]; // The dividend.
             SHDRInstructionOperand src1 = inst.operands[2]; // The divisor.
@@ -699,6 +707,45 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
             usilInst.isIntUnsigned = inst.opcode == Opcode.udiv;
 
             Instructions.Add(usilInst);
+        }
+
+        // udiv quotient, remainder, dividend, divisor: either destination can be null (discarded).
+        private void HandleUDiv(SHDRInstruction inst)
+        {
+            SHDRInstructionOperand quotient = inst.operands[0];
+            SHDRInstructionOperand remainder = inst.operands[1];
+            SHDRInstructionOperand src0 = inst.operands[2];
+            SHDRInstructionOperand src1 = inst.operands[3];
+
+            foreach (var (dest, type) in new[] { (quotient, USILInstructionType.Divide), (remainder, USILInstructionType.Modulus) })
+            {
+                if (dest.operand == Operand.Null)
+                {
+                    continue;
+                }
+
+                USILInstruction usilInst = new USILInstruction();
+                USILOperand usilDest = new USILOperand();
+                USILOperand usilSrc0 = new USILOperand();
+                USILOperand usilSrc1 = new USILOperand();
+
+                FillUSILOperand(dest, usilDest, dest.swizzle, true);
+                FillUSILOperand(src0, usilSrc0, MapMask(dest.swizzle, src0.swizzle), true);
+                FillUSILOperand(src1, usilSrc1, MapMask(dest.swizzle, src1.swizzle), true);
+
+                usilInst.instructionType = type;
+                usilInst.destOperand = usilDest;
+                usilInst.srcOperands = new List<USILOperand>
+                {
+                    usilSrc0,
+                    usilSrc1
+                };
+                usilInst.saturate = inst.saturated;
+                usilInst.isIntVariant = true;
+                usilInst.isIntUnsigned = true;
+
+                Instructions.Add(usilInst);
+            }
         }
 
         private void HandleMad(SHDRInstruction inst)
@@ -1597,7 +1644,8 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
             usilInst.srcOperands = new List<USILOperand>
             {
                 usilSrcAddress,
-                usilSrcResource
+                usilSrcResource,
+                new USILOperand((int)dimension) // the declared dimension, for an unnamed resource's declaration
             };
 
             Instructions.Add(usilInst);
@@ -1637,7 +1685,8 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
             {
                 usilSrcAddress,
                 usilSrcByteOffset,
-                usilSrc0
+                usilSrc0,
+                new USILOperand(_resourceToStride.GetValueOrDefault(src0.arraySizes[0], 16)) // element stride in bytes
             };
 
             Instructions.Add(usilInst);
@@ -2164,6 +2213,12 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
             ResourceDimension dimension = inst.declData.resourceDimension;
             int regIndex = inst.declData.operands[0].arraySizes[0]; // todo: not always tX
             _resourceToDimension[regIndex] = dimension;
+        }
+
+        private void HandleResourceStructured(SHDRInstruction inst)
+        {
+            int regIndex = inst.declData.operands[0].arraySizes[0];
+            _resourceToStride[regIndex] = inst.declData.structStride;
         }
 
         private void HandleCustomData(SHDRInstruction inst)

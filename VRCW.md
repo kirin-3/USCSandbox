@@ -31,6 +31,45 @@ Release `vrcw-3` adds these fixes for shaders that failed in every VRCW run on 2
 
 With these, the shaders of the Popcorn Palace, jbc4 and rainydaze bundles all decompile: 85 (Popcorn, without the 6 that VRCW skips because a real source replaces them), 123 and 108, with no failures. Before, they failed on 7, 6 and 7 shaders.
 
+Release `vrcw-4` fixes the emitter for the shaders that still fell back to a generic body after `vrcw-3`. Each fix was checked by decompiling the saved bundles of eleven worlds and compiling every pass in Unity 2022.3.22f1 (D3D11, batch mode):
+
+7. `ShaderProcessor.cs`: a program built for shader model 5.0 gets `#pragma target 5.0` (it can use instructions and outputs such as `SV_Coverage` that `ps_4_0` does not have).
+8. `ShaderProcessor.cs`, `UnityShaderConstants.cs`: variables that `UnityShaderVariables.cginc` declares in every program (`unity_OrthoParams`, `unity_CameraProjection`, `unity_WorldToCamera`, `unity_StereoWorldToCamera` and the other camera variables) are no longer declared again.
+9. `UShaderFunctionToHLSL.cs`, `DirectXProgramToUSIL.cs`, `SHDR.cs`: a resource register (`rsc<n>`) or constant buffer register (`cb<n>`) that reflection does not name is declared with the type its use implies. `ld` and `ld_structured` become `Load` calls, and a raw buffer is read as `asfloat(buffer.Load4(index * stride + byteOffset))`, with the stride taken from `dcl_resource_structured`.
+10. `UShaderFunctionToHLSL.cs`: a texture the program only loads from or asks the size of is a `Texture2D`, not a `sampler2D` (which has no methods). The size of a texture that is also sampled comes from its `<name>_TexelSize` vector, which is declared.
+11. `UShaderFunctionToHLSL.cs`, `USILSamplerTypeFixer.cs`, `USILSamplerMetadder.cs`: the `UNITY_DECLARE_TEX*_NOSAMPLER` textures of `UnityShaderVariables.cginc` (`unity_SpecCube1`, `unity_DynamicLightmap`, `unity_ShadowMask` and the like) sample with the sampler of the texture that owns it. The `*_SAMPLER` macros are called with their arguments in the order Unity defines (texture, sampler owner, rest).
+12. `USILOperand.cs`: infinity and NaN literals are written as `asfloat(...)`; `float.ToString` wrote `Infinity` and `NaN`, which HLSL does not parse.
+13. `UShaderFunctionToHLSL.cs`: `udiv` with a discarded quotient or remainder no longer writes `null`.
+14. `ShaderProcessor.cs`: the struct parameters of `UnityInstancing.cginc`'s instanced buffers (`unity_Builtins0Array` and the like) are declared the way `UNITY_INSTANCING_BUFFER_START` declares them: an instancing cbuffer holding an anonymous struct array, with the code's `name.member` reaching the first instance. A cbuffer that Unity's includes do not declare (`UnityDrawCallInfo`, `UnityPerMaterial`, a custom `CBUFFER`) is declared as written, not commented out.
+15. `USILForLoopOptimizer.cs`: a loop that could not become a `for` loop no longer leaves its counter name (`i`) behind on the operands after it.
+16. `ShaderProcessor.cs`: a ShaderLab `Int` property's default is written as the integer. Unity stores it as float bits, and `1` was written as `1E-45`.
+17. `UShaderFunctionToHLSL.cs`: in a vertex input or output struct, members with a system-generated semantic (`SV_InstanceID`, `SV_VertexID`, `SV_IsFrontFace` and the like) are written last. HLSL rejects any parameter after a system-generated one.
+
+### Known limitations of `vrcw-4`
+
+Passes that still fall back to the generic body, grouped by the first error Unity reports. Counts are passes over the eleven worlds, and the causes are not investigated unless the line says so.
+
+| Error | Passes | Example |
+| --- | --- | --- |
+| `invalid subscript 'x'` | 26 | `Hidden/VRCFury/SpsResolver`, `Hidden/VRCM4/Line Subdivided` (`data`) |
+| `$Globals` is over 65536 bytes | 27 | `AudioLink/Internal/AudioLink`: the shader's own material block, once every array is declared, is 131776 bytes |
+| a parameter after a system-generated value | 22 | `Mochie/Water`: the line Unity reports is `frag(v2f inp, uint facing : VFACE)` |
+| `tex2D` or `Sample` with no matching overload | 18 | `Warren's Fast Fur`, `TsunaMoo/Party FX`: a texture of another dimension is typed `sampler2D` |
+| `cannot implicitly convert from 'const float2'` | 15 | `.poiyomi/Poiyomi Toon` |
+| `GetDimensions` with five arguments | 13 | `Hidden/ltspass_opaque` |
+| `sampler2D object does not have methods` | 9 | `Hidden/SPSPatched/...`: a texture that is both sampled and loaded from |
+| `Too few arguments to a macro call` | 10 | `Hidden/ltspass_opaque`, `Mochie/Water` |
+| `undeclared identifier 'unity_DynamicLightmap_HDR'` | 7 | `.poiyomi/Poiyomi Toon` |
+| `array index out of bounds` | 6 | `Mochie/Standard`, `Mochie/Standard (Lite)` |
+| `redefinition of 'unity_WorldToLight'` | 13 | `orels1/Standard`, `orels1/Particles/Fish`: the shader's material block lists it, and `AutoLight.cginc` declares it too in the `POINT`, `SPOT` and cookie variants. Adding it to the included names, or declaring it only when those keywords are off, leaves it undeclared in other variants (65 passes), because `AutoLight.cginc` is not in every program |
+| `redefinition of 'unity_BaseInstanceID'` | 8 | `orels1/Particles/Fish`, `Silent/Volumetric Box`: the same trade-off with `UnityInstancing.cginc` |
+| `redefinition` of a material property | 4 | `JLChnToZ/VideoRoundCorner` (`_StereoExtend`), `orels1/VFX/Ghost Lines` (`_BakedNoiseTex`) |
+| `undeclared identifier '_fallspeed'` | 1 | `sunny/Choco_fountain` |
+| `unable to unroll loop` | 1 | `Lit`: 26 iterations without `[loop]` |
+| ShaderLab parse error `TVAL_ID` | 4 | `orels1/Toon/Cutout` |
+
+The harness cannot check some passes and reports `Unity did not import this pass` for them: the second `FORWARD` pass of `Rain/RainScroller`, `VRCCoffee/Cafe Liquid`, `VRCCoffee/Ice`, `DummyReflectionWater`, `Thad/Crystal` and `Hidden/SPSPatched/...`. The `vrcw-3` output of the same shaders gets the same result, so it is the check, not the emitter.
+
 ## Build
 
 Release `vrcw-1` was built on Windows with the .NET SDK 10.0.302, from a fresh clone of tag `vrcw-1`:
@@ -50,3 +89,5 @@ Release `vrcw-2` changes no code. Tag `vrcw-2` adds upstream's GPL-3.0 `license`
 The source of release `vrcw-2` is tag [`vrcw-2`](https://github.com/kirin-3/USCSandbox/tree/vrcw-2).
 
 Release `vrcw-3` is a rebuild with the fixes above. It was built the same way as `vrcw-1`, from a fresh clone of tag [`vrcw-3`](https://github.com/kirin-3/USCSandbox/tree/vrcw-3), and `license` was also copied into `out\`. Its zip is `USCSandbox-vrcw-3-win-x64.zip`.
+
+Release `vrcw-4` is a rebuild with the fixes above (7 to 17). It was built the same way as `vrcw-3`, from a fresh clone of tag [`vrcw-4`](https://github.com/kirin-3/USCSandbox/tree/vrcw-4), with `license` and `readme.md` copied into `out\` and a `SOURCE.txt` naming the tag. Its zip is `USCSandbox-vrcw-4-win-x64.zip`.

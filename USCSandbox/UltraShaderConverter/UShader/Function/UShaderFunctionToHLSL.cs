@@ -1,4 +1,5 @@
 ﻿using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL;
+using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Fixers;
 using System.Globalization;
 using System.Text;
 
@@ -11,6 +12,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
         private string _baseIndent;
         private string _indent;
         private int _indentLevel;
+        private int _scratchCount;
 
         private delegate void InstHandler(USILInstruction inst);
         private Dictionary<USILInstructionType, InstHandler> _instructionHandlers;
@@ -30,6 +32,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
                 { USILInstructionType.Subtract, new InstHandler(HandleSubtract) },
                 { USILInstructionType.Multiply, new InstHandler(HandleMultiply) },
                 { USILInstructionType.Divide, new InstHandler(HandleDivide) },
+                { USILInstructionType.Modulus, new InstHandler(HandleModulus) },
                 { USILInstructionType.MultiplyAdd, new InstHandler(HandleMultiplyAdd) },
                 { USILInstructionType.And, new InstHandler(HandleAnd) },
                 { USILInstructionType.Or, new InstHandler(HandleOr) },
@@ -100,6 +103,18 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             };
         }
 
+        private static readonly HashSet<string> SystemGeneratedSemantics = new(StringComparer.OrdinalIgnoreCase)
+        {
+            "SV_InstanceID", "SV_PrimitiveID", "SV_VertexID", "SV_IsFrontFace", "SV_SampleIndex", "SV_RenderTargetArrayIndex", "SV_ViewportArrayIndex"
+        };
+
+        // HLSL does not accept a parameter after a system-generated value in a signature, so those members go last.
+        private static IEnumerable<USILInputOutput> SystemGeneratedLast(IEnumerable<USILInputOutput> members)
+        {
+            List<USILInputOutput> all = members.ToList();
+            return all.Where(m => !SystemGeneratedSemantics.Contains(m.type ?? "")).Concat(all.Where(m => SystemGeneratedSemantics.Contains(m.type ?? "")));
+        }
+
         public string WriteStruct()
         {
             _stringBuilder.Clear();
@@ -109,7 +124,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
                 AppendLine("struct appdata");
                 AppendLine("{");
                 _indentLevel++;
-                foreach (USILInputOutput input in _shader.inputs)
+                foreach (USILInputOutput input in SystemGeneratedLast(_shader.inputs))
                 {
                     AppendLine($"{input.format} {input.name} : {input.type};");
                 }
@@ -119,7 +134,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
                 AppendLine("struct v2f");
                 AppendLine("{");
                 _indentLevel++;
-                foreach (USILInputOutput output in _shader.outputs)
+                foreach (USILInputOutput output in SystemGeneratedLast(_shader.outputs))
                 {
                     AppendLine($"{output.format} {output.name} : {output.type};");
                 }
@@ -257,6 +272,13 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             string value = WrapSaturate(inst, $"{srcOps[0]} / {srcOps[1]}");
             string comment = CommentString(inst);
             AppendLine($"{comment}{inst.destOperand} = {value};");
+        }
+
+        private void HandleModulus(USILInstruction inst)
+        {
+            List<USILOperand> srcOps = inst.srcOperands;
+            string comment = CommentString(inst);
+            AppendLine($"{comment}{inst.destOperand} = {srcOps[0]} % {srcOps[1]};");
         }
 
         private void HandleMultiplyAdd(USILInstruction inst)
@@ -512,6 +534,12 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             AppendLine($"{comment}{inst.destOperand} = {value};");
         }
 
+        // The sampler a *_SAMPLER macro is given: the texture itself, or for a NOSAMPLER built-in the texture that owns its sampler.
+        private static string SamplerArgument(USILOperand texture) =>
+            texture.metadataName != null && USILSamplerTypeFixer.SHARED_SAMPLER_TEXTURE_NAMES.TryGetValue(texture.metadataName, out string? owner)
+                ? owner
+                : texture.ToString();
+
         private void HandleSample(USILInstruction inst)
         {
             List<USILOperand> srcOps = inst.srcOperands;
@@ -534,7 +562,8 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             }
             else
             {
-                args = $"{srcOps[2]}, {args}";
+                // args is "texture, rest": the macros take (texture, the texture whose sampler is used, rest).
+                args = $"{srcOps[2]}, {SamplerArgument(textureOperand)}, {args.Substring(srcOps[2].ToString().Length + 2)}";
                 value = textureOperand.operandType switch
                 {
                     USILOperandType.Sampler2D => $"UNITY_SAMPLE_TEX2D_SAMPLER({args})",
@@ -579,7 +608,8 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             }
             else
             {
-                args = $"{srcOps[2]}, {args}";
+                // args is "texture, rest": the macros take (texture, the texture whose sampler is used, rest).
+                args = $"{srcOps[2]}, {SamplerArgument(textureOperand)}, {args.Substring(srcOps[2].ToString().Length + 2)}";
                 value = textureOperand.operandType switch
                 {
                     USILOperandType.Sampler2D => $"UNITY_SAMPLE_TEX2D_SAMPLER({args})",
@@ -611,25 +641,238 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             AppendLine($"{comment}{inst.destOperand} = {value};");
         }
 
+        // The components of a loaded value the destination takes: the resource's swizzle, as many as the destination has.
+        private static string Swizzle(USILOperand operand, USILOperand? destination)
+        {
+            if (operand.mask == null || operand.mask.Length == 0)
+            {
+                return "";
+            }
+
+            IEnumerable<int> mask = operand.mask;
+            if (destination != null && destination.mask.Length > 0 && destination.mask.Length < operand.mask.Length)
+            {
+                mask = mask.Take(destination.mask.Length);
+            }
+
+            string swizzle = string.Concat(mask.Select(m => USILConstants.MASK_CHARS[m]));
+            return swizzle == "xyzw" ? "" : "." + swizzle;
+        }
+
         private void HandleLoadResource(USILInstruction inst)
         {
+            // dx: ld dest, address, resource. HLSL reads texels through the resource object: resource.Load(int3(x, y, mip)).
             List<USILOperand> srcOps = inst.srcOperands;
-            string args = $"{srcOps[1]}, {srcOps[0]}";
-            string value = $"Load({args})";
+            USILOperand address = srcOps[0];
+            USILOperand resource = srcOps[1];
+            int components = Math.Max(1, address.GetValueCount());
+            string coordinate = components == 1 ? $"int({address})" : $"int{components}({address})";
+            string value = $"{resource.ToString(true)}.Load({coordinate}){Swizzle(resource, inst.destOperand)}";
             string comment = CommentString(inst);
             AppendLine($"{comment}{inst.destOperand} = {value};");
         }
 
         private void HandleLoadResourceStructured(USILInstruction inst)
         {
-            // todo (won't work because struct doesn't exist)
-            // DXDecompiler: ((float4[arraySize])_Buffer.Load(srcAddress))[srcByteOffset / 16];
-            // 3DMigoto: _Buffer[srcAddress].val[srcByteOffset/4]; (with /4 literally part of the output lmao)
-            // yo idk
+            // dx: ld_structured dest, index, byteOffset, buffer. The element layout is not in the program, so the buffer
+            // is read as raw dwords: asfloat(buffer.Load4(index * stride + byteOffset)).
             List<USILOperand> srcOps = inst.srcOperands;
-            string value = $"((float4[1]){srcOps[2]}.Load({srcOps[0]}))[{srcOps[1].immValueInt[0] / 16}]";
+            USILOperand address = srcOps[0];
+            USILOperand offset = srcOps[1];
+            USILOperand resource = srcOps[2];
+            int stride = srcOps.Count > 3 && srcOps[3].immValueInt is { Length: > 0 } && srcOps[3].immValueInt[0] > 0 ? srcOps[3].immValueInt[0] : 16;
+            string byteOffset = offset.immValueInt is { Length: > 0 } ? offset.immValueInt[0].ToString(CultureInfo.InvariantCulture) : $"uint({offset})";
+            string value = $"asfloat({resource.ToString(true)}.Load4(uint({address}) * {stride} + {byteOffset})){Swizzle(resource, inst.destOperand)}";
             string comment = CommentString(inst);
             AppendLine($"{comment}{inst.destOperand} = {value};");
+        }
+
+        private IEnumerable<USILOperand> AllOperands(USILOperand? operand)
+        {
+            if (operand == null)
+            {
+                yield break;
+            }
+
+            yield return operand;
+            foreach (USILOperand child in AllOperands(operand.arrayRelative))
+            {
+                yield return child;
+            }
+
+            if (operand.children != null)
+            {
+                foreach (USILOperand childOperand in operand.children)
+                {
+                    foreach (USILOperand child in AllOperands(childOperand))
+                    {
+                        yield return child;
+                    }
+                }
+            }
+        }
+
+        private IEnumerable<(USILInstruction Instruction, USILOperand Operand)> AllInstructionOperands()
+        {
+            foreach (USILInstruction instruction in _shader.instructions)
+            {
+                foreach (USILOperand operand in AllOperands(instruction.destOperand))
+                {
+                    yield return (instruction, operand);
+                }
+
+                foreach (USILOperand source in instruction.srcOperands ?? new List<USILOperand>())
+                {
+                    foreach (USILOperand operand in AllOperands(source))
+                    {
+                        yield return (instruction, operand);
+                    }
+                }
+            }
+        }
+
+        private static bool IsDimensionInfo(USILInstruction instruction) =>
+            instruction.instructionType == USILInstructionType.ResourceDimensionInfo || instruction.instructionType == USILInstructionType.GetDimensions;
+
+        private HashSet<string>? _sampledNames;
+
+        /// <summary>Named textures the program samples (tex2D and the like).</summary>
+        private HashSet<string> SampledTextureNames()
+        {
+            if (_sampledNames == null)
+            {
+                _sampledNames = new();
+                foreach (var (_, operand) in AllInstructionOperands())
+                {
+                    if (operand.metadataNameAssigned && !string.IsNullOrEmpty(operand.metadataName) &&
+                        operand.operandType is USILOperandType.Sampler2D or USILOperandType.Sampler3D or USILOperandType.SamplerCube
+                            or USILOperandType.Sampler2DArray or USILOperandType.SamplerCubeArray)
+                    {
+                        _sampledNames.Add(operand.metadataName!);
+                    }
+                }
+            }
+
+            return _sampledNames;
+        }
+
+        /// <summary>Named textures this program reads texel by texel (ld) or asks the size of, and never samples: they are Texture objects, not sampler2D.</summary>
+        public HashSet<string> GetTextureObjectNames()
+        {
+            HashSet<string> objects = new();
+            foreach (var (instruction, operand) in AllInstructionOperands())
+            {
+                if (!operand.metadataNameAssigned || string.IsNullOrEmpty(operand.metadataName) ||
+                    operand.operandType != USILOperandType.ResourceRegister || operand.bufferResource)
+                {
+                    continue;
+                }
+
+                if (instruction.instructionType == USILInstructionType.LoadResource || instruction.instructionType == USILInstructionType.LoadResourceMultisampled ||
+                    IsDimensionInfo(instruction))
+                {
+                    objects.Add(operand.metadataName!);
+                }
+            }
+
+            objects.ExceptWith(SampledTextureNames());
+            return objects;
+        }
+
+        private static string TextureObjectType(int dimension) => dimension switch
+        {
+            1 => "Buffer<float4>",
+            2 => "Texture1D<float4>",
+            4 => "Texture2DMS<float4>",
+            5 => "Texture3D<float4>",
+            6 => "TextureCube<float4>",
+            7 => "Texture1DArray<float4>",
+            8 => "Texture2DArray<float4>",
+            9 => "Texture2DMSArray<float4>",
+            10 => "TextureCubeArray<float4>",
+            _ => "Texture2D<float4>",
+        };
+
+        /// <summary>
+        /// Declarations for what the program reads and reflection does not name: a resource register (rsc0) and a constant buffer
+        /// register (cb0), and the buffers reflection names as buffers. Names already in <paramref name="declared"/> are skipped.
+        /// </summary>
+        public string WriteUnnamedDeclarations(HashSet<string> declared, int depth)
+        {
+            Dictionary<string, string> resources = new();
+            Dictionary<int, (int Size, bool Relative)> constantBuffers = new();
+            foreach (var (instruction, operand) in AllInstructionOperands())
+            {
+                if (operand.operandType == USILOperandType.ResourceRegister)
+                {
+                    bool structured = instruction.instructionType == USILInstructionType.LoadResourceStructured;
+                    bool loaded = instruction.instructionType == USILInstructionType.LoadResource || instruction.instructionType == USILInstructionType.LoadResourceMultisampled;
+                    string name = operand.metadataNameAssigned ? operand.metadataName ?? "" : $"rsc{operand.registerIndex}";
+                    // Named texture parameters are declared with the program's textures; a name from the buffer bindings is not.
+                    if (name.Length == 0 || operand.metadataNameAssigned && !operand.bufferResource)
+                    {
+                        continue;
+                    }
+
+                    if (structured)
+                    {
+                        resources[name] = "ByteAddressBuffer";
+                    }
+                    else if (loaded && !resources.ContainsKey(name))
+                    {
+                        resources[name] = TextureObjectType(instruction.srcOperands.Count > 2 && instruction.srcOperands[2].immValueInt is { Length: > 0 } ? instruction.srcOperands[2].immValueInt[0] : 3);
+                    }
+                    else if (!resources.ContainsKey(name))
+                    {
+                        resources[name] = operand.bufferResource ? "ByteAddressBuffer" : "Texture2D<float4>";
+                    }
+                }
+                else if (operand.operandType == USILOperandType.ConstantBuffer && !operand.metadataNameAssigned)
+                {
+                    constantBuffers.TryGetValue(operand.registerIndex, out var known);
+                    int size = operand.arrayRelative != null ? 4096 : operand.arrayIndex + 1;
+                    constantBuffers[operand.registerIndex] = (Math.Max(known.Size, size), known.Relative || operand.arrayRelative != null);
+                }
+            }
+
+            // The size of a texture that is also sampled comes from its _TexelSize vector (see HandleResourceDimensionInfo).
+            HashSet<string> texelSizes = new();
+            foreach (var (instruction, operand) in AllInstructionOperands())
+            {
+                if (IsDimensionInfo(instruction) && operand.operandType == USILOperandType.ResourceRegister && operand.metadataNameAssigned &&
+                    !operand.bufferResource && operand.metadataName != null && SampledTextureNames().Contains(operand.metadataName))
+                {
+                    texelSizes.Add(operand.metadataName);
+                }
+            }
+
+            StringBuilder sb = new();
+            string indent = new string(' ', depth * 4);
+            foreach (string name in texelSizes.Order(StringComparer.Ordinal))
+            {
+                if (declared.Add(name + "_TexelSize"))
+                {
+                    sb.AppendLine($"{indent}float4 {name}_TexelSize; // the size of {name}, which is also sampled");
+                }
+            }
+
+            foreach ((string name, string type) in resources.OrderBy(r => r.Key, StringComparer.Ordinal))
+            {
+                if (declared.Add(name))
+                {
+                    sb.AppendLine($"{indent}{type} {name}; // no name in the shader's reflection data");
+                }
+            }
+
+            foreach ((int register, (int size, bool _)) in constantBuffers.OrderBy(c => c.Key))
+            {
+                if (declared.Add($"cb{register}"))
+                {
+                    sb.AppendLine($"{indent}float4 cb{register}[{size}]; // constant buffer {register}, no names in the shader's reflection data");
+                }
+            }
+
+            return sb.ToString();
         }
 
         private void HandleDiscard(USILInstruction inst)
@@ -650,12 +893,54 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             USILOperand usilDepthOrArraySize = srcOps[4];
             USILOperand usilMipCount = srcOps[5];
 
+            // A sampled texture is a sampler2D, which has no GetDimensions; its _TexelSize vector holds (1/w, 1/h, w, h).
+            if (usilResource.metadataNameAssigned && !usilResource.bufferResource && usilResource.metadataName != null &&
+                SampledTextureNames().Contains(usilResource.metadataName))
+            {
+                string texelSize = $"{usilResource.metadataName}_TexelSize";
+                string commentLine = CommentString(inst);
+                if (usilWidth.operandType != USILOperandType.Null)
+                {
+                    AppendLine($"{commentLine}{usilWidth} = {texelSize}.z;");
+                }
+
+                if (usilHeight.operandType != USILOperandType.Null)
+                {
+                    AppendLine($"{commentLine}{usilHeight} = {texelSize}.w;");
+                }
+
+                if (usilDepthOrArraySize.operandType != USILOperandType.Null)
+                {
+                    AppendLine($"{commentLine}{usilDepthOrArraySize} = 1.0;");
+                }
+
+                if (usilMipCount.operandType != USILOperandType.Null)
+                {
+                    AppendLine($"{commentLine}{usilMipCount} = 1.0;");
+                }
+
+                return;
+            }
+
             List<string> args = new List<string>();
+
+            // GetDimensions needs a variable for every output it is given, so an unused output gets a scratch one.
+            string Output(USILOperand operand)
+            {
+                if (operand.operandType != USILOperandType.Null)
+                {
+                    return operand.ToString();
+                }
+
+                string scratch = $"rscUnused{_scratchCount++}";
+                AppendLine($"float {scratch};");
+                return scratch;
+            }
 
             if (usilMipLevel.immValueFloat[0] == 0 && usilMipCount.operandType == USILOperandType.Null)
             {
                 // shorter version (not checking the compiler did this correctly!)
-                args.Add(usilWidth.ToString());
+                args.Add(Output(usilWidth));
 
                 if (usilHeight.operandType != USILOperandType.Null)
                 {
@@ -670,7 +955,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             else
             {
                 args.Add(usilMipLevel.ToString());
-                args.Add(usilWidth.ToString());
+                args.Add(Output(usilWidth));
 
                 if (usilHeight.operandType != USILOperandType.Null)
                 {
@@ -688,7 +973,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
                 }
                 else
                 {
-                    args.Add("resinfo_extra");
+                    args.Add(Output(usilMipCount));
                 }
             }
 

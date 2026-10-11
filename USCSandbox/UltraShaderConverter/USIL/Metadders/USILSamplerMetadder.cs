@@ -68,6 +68,15 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Metadders
 
                         if (texParam == null)
                         {
+                            BufferBinding? buffer = shaderParams.Buffers.FirstOrDefault(b => b.Index == operand.registerIndex);
+                            if (buffer != null)
+                            {
+                                operand.metadataName = buffer.Name;
+                                operand.metadataNameAssigned = true;
+                                operand.bufferResource = true;
+                                continue;
+                            }
+
                             Logger.Warning($"Could not find texture parameter for resource {operand}");
                             continue;
                         }

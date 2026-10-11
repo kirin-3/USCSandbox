@@ -541,6 +541,9 @@
         public int tgsmStride;
         public int tgsmCount;
 
+        // dcl_resource_structured: the byte stride of one element
+        public int structStride;
+
         public SHDRInstructionOperand[] operands = Array.Empty<SHDRInstructionOperand>();
 
         private static readonly string[] nameTokens =
@@ -587,6 +590,15 @@
                     {
                         new SHDRInstructionOperand(reader)
                     };
+                    break;
+                }
+                case Opcode.dcl_resource_structured:
+                {
+                    operands = new SHDRInstructionOperand[1]
+                    {
+                        new SHDRInstructionOperand(reader)
+                    };
+                    structStride = reader.ReadInt32();
                     break;
                 }
                 case Opcode.dcl_indexrange:
