@@ -45,6 +45,10 @@ Release `vrcw-4` fixes the emitter for the shaders that still fell back to a gen
 16. `ShaderProcessor.cs`: a ShaderLab `Int` property's default is written as the integer. Unity stores it as float bits, and `1` was written as `1E-45`.
 17. `UShaderFunctionToHLSL.cs`: in a vertex input or output struct, members with a system-generated semantic (`SV_InstanceID`, `SV_VertexID`, `SV_IsFrontFace` and the like) are written last. HLSL rejects any parameter after a system-generated one.
 
+Release `vrcw-5` fixes the `$Globals` row of the table below:
+
+18. `ShaderProcessor.cs`: a cbuffer that Unity's includes do not declare is written as a real `CBUFFER_START`/`CBUFFER_END` around all of its variables. `vrcw-4` commented the markers out and closed the block after the first variable, so the variables landed in `$Globals`. AudioLink's eight `float[1023]` sample arrays made it 131776 bytes, and UnityShaderCompiler.exe failed on the import (`Internal error communicating with the shader compiler process`). The vertex and fragment programs of a pass share one file, so only the first program to use a cbuffer writes the wrapper; the other's variables not yet declared stay plain globals. An instancing cbuffer whose name is taken gets `_Instanced` appended. On for-my-love's `AudioLink/Internal/AudioLink`, 11 of 12 passes now compile, against 10 with `vrcw-4`. The one left fails on `array index out of bounds` in its `STEREO_INSTANCING_ON` variant.
+
 ### Known limitations of `vrcw-4`
 
 Passes that still fall back to the generic body, grouped by the first error Unity reports. Counts are passes over the eleven worlds, and the causes are not investigated unless the line says so.
@@ -91,3 +95,5 @@ The source of release `vrcw-2` is tag [`vrcw-2`](https://github.com/kirin-3/USCS
 Release `vrcw-3` is a rebuild with the fixes above. It was built the same way as `vrcw-1`, from a fresh clone of tag [`vrcw-3`](https://github.com/kirin-3/USCSandbox/tree/vrcw-3), and `license` was also copied into `out\`. Its zip is `USCSandbox-vrcw-3-win-x64.zip`.
 
 Release `vrcw-4` is a rebuild with the fixes above (7 to 17). It was built the same way as `vrcw-3`, from a fresh clone of tag [`vrcw-4`](https://github.com/kirin-3/USCSandbox/tree/vrcw-4), with `license` and `readme.md` copied into `out\` and a `SOURCE.txt` naming the tag. Its zip is `USCSandbox-vrcw-4-win-x64.zip`.
+
+Release `vrcw-5` is a rebuild with fix 18. It was built the same way as `vrcw-4`, from a fresh clone of tag [`vrcw-5`](https://github.com/kirin-3/USCSandbox/tree/vrcw-5), with `license` and `readme.md` copied into `out\` and a `SOURCE.txt` naming the tag. Its zip is `USCSandbox-vrcw-5-win-x64.zip`.

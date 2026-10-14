@@ -357,7 +357,13 @@ namespace USCSandbox.Processor
                 int cbufferIndex = shaderParams.ConstantBuffers.IndexOf(cbuffer);
 
                 bool wroteCbufferHeaderYet = false;
-                
+                // A cbuffer that Unity's includes declare is written as a comment. Any other is the program's own and is a real
+                // cbuffer around all of its variables: written into $Globals, two 4-array sample buffers (AudioLink) overflow it.
+                string cbufferComment = DeclaredByUnityIncludes(cbuffer.Name) ? "// " : "";
+                // The vertex and fragment programs of a pass share one file, and a cbuffer name can be declared once. The first
+                // program to use a cbuffer gets the wrapper; the other's variables not yet declared are plain globals.
+                bool wrapCbuffer = nonGlobalCbuffer && declaredCBufs.Add("cbuffer " + cbuffer.Name);
+
                 char[] chars = new char[] { 'x', 'y', 'z', 'w' };
                 List<ConstantBufferParameter> allParams = cbuffer.CBParams;
                 foreach (ConstantBufferParameter param in allParams)
@@ -371,11 +377,12 @@ namespace USCSandbox.Processor
                         continue;
                     }
                     
-                    if (!wroteCbufferHeaderYet && nonGlobalCbuffer)
+                    if (!wroteCbufferHeaderYet && wrapCbuffer)
                     {
                         sb.Append(new string(' ', depth * 4)); // todo: new stringbuilder
-                        sb.AppendLine($"// CBUFFER_START({cbuffer.Name}) // {cbufferIndex}");
+                        sb.AppendLine($"{cbufferComment}CBUFFER_START({cbuffer.Name}) // {cbufferIndex}");
                         depth++;
+                        wroteCbufferHeaderYet = true;
                     }
 
                     if (!declaredCBufs.Contains(name))
@@ -396,14 +403,13 @@ namespace USCSandbox.Processor
                         }
                         declaredCBufs.Add(name);
                     }
+                }
 
-                    if (!wroteCbufferHeaderYet && nonGlobalCbuffer)
-                    {
-                        depth--;
-                        sb.Append(new string(' ', depth * 4));
-                        sb.AppendLine("// CBUFFER_END");
-                        wroteCbufferHeaderYet = true;
-                    }
+                if (wroteCbufferHeaderYet)
+                {
+                    depth--;
+                    sb.Append(new string(' ', depth * 4));
+                    sb.AppendLine($"{cbufferComment}CBUFFER_END");
                 }
 
                 // Struct parameters (unity_Builtins0Array, from UnityInstancing.cginc's instanced buffers) are named in code as
@@ -417,7 +423,8 @@ namespace USCSandbox.Processor
                         // Unity only accepts struct variables in an instancing cbuffer, written as UNITY_INSTANCING_BUFFER_START does:
                         // an anonymous struct and an array of it. Decompiled code names the members of the one struct (name.member),
                         // so the first instance is defined under that name.
-                        sb.AppendLine(pad + "CBUFFER_START(" + cbuffer.Name + ")");
+                        // a cbuffer of this name may already be written above with the shader's plain variables
+                        sb.AppendLine(pad + "CBUFFER_START(" + cbuffer.Name + (wrapCbuffer && wroteCbufferHeaderYet || !wrapCbuffer && nonGlobalCbuffer ? "_Instanced" : "") + ")");
                         foreach (StructParameter structParam in structs)
                         {
                             declaredCBufs.Add(structParam.Name);
