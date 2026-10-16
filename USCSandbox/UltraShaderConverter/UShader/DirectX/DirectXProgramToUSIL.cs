@@ -118,6 +118,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
                 { Opcode.ret, new InstHandler(HandleRet) },
                 ////dec
                 { Opcode.dcl_temps, new InstHandler(HandleTemps) },
+                { Opcode.dcl_constantbuffer, new InstHandler(HandleConstantBuffer) },
                 { Opcode.dcl_resource, new InstHandler(HandleResource) },
                 { Opcode.dcl_resource_structured, new InstHandler(HandleResourceStructured) },
                 { Opcode.customdata, new InstHandler(HandleCustomData) }
@@ -2195,6 +2196,12 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Direct
             usilInst.instructionType = USILInstructionType.Return;
             usilInst.srcOperands = new List<USILOperand>();
             Instructions.Add(usilInst);
+        }
+
+        private void HandleConstantBuffer(SHDRInstruction inst)
+        {
+            var indices = inst.declData.operands[0].arraySizes;
+            shader.constantBufferSizes[indices[0]] = indices[1];
         }
 
         private void HandleTemps(SHDRInstruction inst)

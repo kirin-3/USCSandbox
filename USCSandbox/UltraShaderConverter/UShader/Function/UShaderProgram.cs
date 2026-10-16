@@ -9,6 +9,7 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
         public List<USILInstruction> instructions;
         public List<USILInputOutput> inputs;
         public List<USILInputOutput> outputs;
+        public Dictionary<int, int> constantBufferSizes = new();
 
         public UShaderProgram()
         {

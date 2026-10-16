@@ -1,5 +1,6 @@
-﻿using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL;
+using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL;
 using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Fixers;
+using USCSandbox.Processor;
 using System.Globalization;
 using System.Text;
 
@@ -13,13 +14,17 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
         private string _indent;
         private int _indentLevel;
         private int _scratchCount;
+        private readonly Dictionary<string, int> _textureDims = new(StringComparer.Ordinal);
 
         private delegate void InstHandler(USILInstruction inst);
         private Dictionary<USILInstructionType, InstHandler> _instructionHandlers;
 
-        public UShaderFunctionToHLSL(UShaderProgram shader, int indentDepth)
+        public UShaderFunctionToHLSL(UShaderProgram shader, int indentDepth, List<TextureParameter>? textureParams = null)
         {
             _shader = shader;
+            if (textureParams != null)
+                foreach (TextureParameter param in textureParams)
+                    _textureDims.TryAdd(param.Name, param.Dim);
 
             _baseIndent = new string(' ', indentDepth * 4);
             _indent = new string(' ', 4);
@@ -157,13 +162,14 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             return _stringBuilder.ToString();
         }
 
-        public string WriteFunction()
+        public string WriteFunction(bool retainVolumeSamplers = false)
         {
             _stringBuilder.Clear();
 
             WriteFunctionDefinition();
             {
                 WriteLocals();
+                if (retainVolumeSamplers) WriteVolumeSamplerBindings();
                 foreach (USILInstruction inst in _shader.instructions)
                 {
                     if (_instructionHandlers.ContainsKey(inst.instructionType))
@@ -176,6 +182,23 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             AppendLine("}");
 
             return _stringBuilder.ToString();
+        }
+
+        private void WriteVolumeSamplerBindings()
+        {
+            foreach (string owner in GetSamplerOwners().Where(n => _textureDims.TryGetValue(n, out int dim) && dim == 3).Order(StringComparer.Ordinal))
+            {
+                string prefix = $"rscSamplerBinding{_scratchCount++}";
+                AppendLine($"uint {prefix}Width, {prefix}Height, {prefix}Depth, {prefix}Levels;");
+                AppendLine($"{owner}.GetDimensions(0, {prefix}Width, {prefix}Height, {prefix}Depth, {prefix}Levels);");
+                // Unity cannot bind a borrowed sampler after FXC removes its owning texture. A valid
+                // hardware texture width is below 2^31, so its bit pattern is a nonnegative float.
+                // This never discards/returns, but retains that resource without changing the sampler.
+                if (_shader.shaderFunctionType == UShaderFunctionType.Fragment)
+                    AppendLine($"clip(asfloat({prefix}Width));");
+                else if (_shader.shaderFunctionType == UShaderFunctionType.Vertex)
+                    AppendLine($"if (asfloat({prefix}Width) < 0) return ({USILConstants.VERT_TO_FRAG_STRUCT_NAME})0;");
+            }
         }
 
         private void WriteFunctionDefinition()
@@ -544,27 +567,49 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
         {
             List<USILOperand> srcOps = inst.srcOperands;
             USILOperand textureOperand = srcOps[2];
-            int samplerTypeIdx = inst.instructionType == USILInstructionType.Sample ? 3 : 4;
-            bool samplerType = srcOps[samplerTypeIdx].immValueInt[0] == 1;
-            string args = $"{srcOps[2]}, {srcOps[0]}";
+            SampleRef reference = ResolveSample(inst);
+            // A separate sample names the read texture; otherwise the sampler names it, as before.
+            string tex = reference.FromResource ? reference.Tex : $"{srcOps[2]}";
+            string coord = $"{srcOps[0]}";
+            // A 3D or cube sample addressed with a 2D coordinate reads direction (x, y, 0), as the packed
+            // texCUBE form did (D2, as in HandleSampleLOD): a combined sampler converted implicitly.
+            string sampleCoord = reference.TexType is USILOperandType.Sampler3D or USILOperandType.SamplerCube &&
+                srcOps[0].mask.Length == 2 ? $"float3({coord}, 0)" : coord;
+            string args = $"{tex}, {coord}";
             string value;
-            if (!samplerType)
+            if (!reference.Separate)
             {
-                value = textureOperand.operandType switch
+                // VRCW vrcw-6 (D2): a texture object has no tex2D; its own-sampler samples go through UNITY_SAMPLE_*.
+                if (GetRewrittenNames().Contains(textureOperand.metadataName ?? ""))
                 {
-                    USILOperandType.Sampler2D => $"tex2D({args})",
-                    USILOperandType.Sampler3D => $"tex3D({args})",
-                    USILOperandType.SamplerCube => $"texCUBE({args})",
-                    USILOperandType.Sampler2DArray => $"UNITY_SAMPLE_TEX2DARRAY({args})",
-                    USILOperandType.SamplerCubeArray => $"UNITY_SAMPLE_TEXCUBEARRAY({args})",
-                    _ => $"texND({args})" // unknown real type
-                };
+                    value = reference.TexType switch
+                    {
+                        USILOperandType.Sampler2D => $"UNITY_SAMPLE_TEX2D({args})",
+                        USILOperandType.Sampler3D => $"UNITY_SAMPLE_TEX3D({tex}, {sampleCoord})",
+                        USILOperandType.SamplerCube => $"UNITY_SAMPLE_TEXCUBE({tex}, {sampleCoord})",
+                        USILOperandType.Sampler2DArray => $"UNITY_SAMPLE_TEX2DARRAY({args})",
+                        USILOperandType.SamplerCubeArray => $"UNITY_SAMPLE_TEXCUBEARRAY({args})",
+                        _ => $"texND({args})" // unknown real type
+                    };
+                }
+                else
+                {
+                    value = textureOperand.operandType switch
+                    {
+                        USILOperandType.Sampler2D => $"tex2D({args})",
+                        USILOperandType.Sampler3D => $"tex3D({args})",
+                        USILOperandType.SamplerCube => $"texCUBE({args})",
+                        USILOperandType.Sampler2DArray => $"UNITY_SAMPLE_TEX2DARRAY({args})",
+                        USILOperandType.SamplerCubeArray => $"UNITY_SAMPLE_TEXCUBEARRAY({args})",
+                        _ => $"texND({args})" // unknown real type
+                    };
+                }
             }
             else
             {
                 // args is "texture, rest": the macros take (texture, the texture whose sampler is used, rest).
-                args = $"{srcOps[2]}, {SamplerArgument(textureOperand)}, {args.Substring(srcOps[2].ToString().Length + 2)}";
-                value = textureOperand.operandType switch
+                args = $"{tex}, {reference.Owner}, {sampleCoord}";
+                value = reference.TexType switch
                 {
                     USILOperandType.Sampler2D => $"UNITY_SAMPLE_TEX2D_SAMPLER({args})",
                     USILOperandType.Sampler3D => $"UNITY_SAMPLE_TEX3D_SAMPLER({args})",
@@ -577,69 +622,99 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             string comment = CommentString(inst);
             AppendLine($"{comment}{inst.destOperand} = {value};");
         }
+
 
         private void HandleSampleLOD(USILInstruction inst)
         {
             List<USILOperand> srcOps = inst.srcOperands;
             USILOperand textureOperand = srcOps[2];
-            bool samplerType = srcOps[4].immValueInt[0] == 1;
+            SampleRef reference = ResolveSample(inst);
+            string tex = reference.FromResource ? reference.Tex : $"{srcOps[2]}";
+            string coord = $"{srcOps[0]}", lod = $"{srcOps[3]}";
             string args;
             if (srcOps[0].mask.Length == 2) // texture2d
             {
-                args = $"{srcOps[2]}, float4({srcOps[0]}, 0, {srcOps[3]})";
+                args = $"{tex}, float4({coord}, 0, {lod})";
             }
             else
             {
-                args = $"{srcOps[2]}, float4({srcOps[0]}, {srcOps[3]})";
+                args = $"{tex}, float4({coord}, {lod})";
             }
+            // A 2D-array coordinate is float3 (uv plus the slice): passed as coord.xyz, never packed with the level.
+            string arrayCoord = srcOps[0].mask.Length == 3 ? coord : $"({coord}).xyz";
+            // A 3D or cube sample addressed with a 2D coordinate reads direction (x, y, 0), as the packed
+            // texCUBE lod form did.
+            string volumeCoord = srcOps[0].mask.Length == 3 ? coord : srcOps[0].mask.Length == 2 ? $"float3({coord}, 0)" : $"({coord}).xyz";
 
             string value;
-            if (!samplerType)
+            if (!reference.Separate)
             {
-                value = textureOperand.operandType switch
+                // VRCW vrcw-6 (D2): Unity's array LOD macros take coordinate and level as separate arguments;
+                // packing them into one float4 is "Too few arguments to a macro call". A texture object has no
+                // tex2Dlod; it samples with its own sampler through UNITY_SAMPLE_*_LOD.
+                bool rewrite = GetRewrittenNames().Contains(textureOperand.metadataName ?? "");
+                value = reference.TexType switch
                 {
-                    USILOperandType.Sampler2D => $"tex2Dlod({args})",
-                    USILOperandType.Sampler3D => $"tex3Dlod({args})",
-                    USILOperandType.SamplerCube => $"texCUBElod({args})",
-                    USILOperandType.Sampler2DArray => $"UNITY_SAMPLE_TEX2DARRAY_LOD({args})",
-                    USILOperandType.SamplerCubeArray => $"UNITY_SAMPLE_TEXCUBEARRAY_LOD({args})",
+                    USILOperandType.Sampler2D => rewrite ? $"UNITY_SAMPLE_TEX2D_LOD({tex}, {coord}, {lod})" : $"tex2Dlod({args})",
+                    USILOperandType.Sampler3D => rewrite ? $"UNITY_SAMPLE_TEX3D_LOD({tex}, {volumeCoord}, {lod})" : $"tex3Dlod({args})",
+                    USILOperandType.SamplerCube => rewrite ? $"UNITY_SAMPLE_TEXCUBE_LOD({tex}, {volumeCoord}, {lod})" : $"texCUBElod({args})",
+                    USILOperandType.Sampler2DArray => $"UNITY_SAMPLE_TEX2DARRAY_LOD({tex}, {arrayCoord}, {lod})",
+                    USILOperandType.SamplerCubeArray => $"UNITY_SAMPLE_TEXCUBEARRAY_LOD({tex}, {coord}, {lod})",
                     _ => $"texNDlod({args})" // unknown real type
                 };
             }
             else
             {
-                // args is "texture, rest": the macros take (texture, the texture whose sampler is used, rest).
-                args = $"{srcOps[2]}, {SamplerArgument(textureOperand)}, {args.Substring(srcOps[2].ToString().Length + 2)}";
-                value = textureOperand.operandType switch
+                // VRCW vrcw-6 (D2): LOD sampling through a separate sampler keeps its level with the _SAMPLER_LOD
+                // macros. The non-LOD macros sample the wrong mip (and, for arrays, do not compile).
+                value = reference.TexType switch
                 {
-                    USILOperandType.Sampler2D => $"UNITY_SAMPLE_TEX2D_SAMPLER({args})",
-                    USILOperandType.Sampler3D => $"UNITY_SAMPLE_TEX3D_SAMPLER({args})",
-                    USILOperandType.SamplerCube => $"UNITY_SAMPLE_TEXCUBE_SAMPLER({args})",
-                    USILOperandType.Sampler2DArray => $"UNITY_SAMPLE_TEX2DARRAY_SAMPLER({args})",
-                    USILOperandType.SamplerCubeArray => $"UNITY_SAMPLE_TEXCUBEARRAY_SAMPLER({args})",
-                    _ => $"texND({args})" // unknown real type
+                    USILOperandType.Sampler2D => $"UNITY_SAMPLE_TEX2D_SAMPLER_LOD({tex}, {reference.Owner}, {coord}, {lod})",
+                    USILOperandType.Sampler3D => $"UNITY_SAMPLE_TEX3D_SAMPLER_LOD({tex}, {reference.Owner}, {volumeCoord}, {lod})",
+                    USILOperandType.SamplerCube => $"UNITY_SAMPLE_TEXCUBE_SAMPLER_LOD({tex}, {reference.Owner}, {volumeCoord}, {lod})",
+                    USILOperandType.Sampler2DArray => $"UNITY_SAMPLE_TEX2DARRAY_SAMPLER_LOD({tex}, {reference.Owner}, {arrayCoord}, {lod})",
+                    USILOperandType.SamplerCubeArray => $"UNITY_SAMPLE_TEXCUBEARRAY_SAMPLER_LOD({tex}, {reference.Owner}, {coord}, {lod})",
+                    _ => $"texND({tex}, {reference.Owner}, {args.Substring(tex.Length + 2)})" // unknown real type
                 };
             }
             string comment = CommentString(inst);
             AppendLine($"{comment}{inst.destOperand} = {value};");
         }
 
+
         private void HandleSampleDerivative(USILInstruction inst)
         {
             List<USILOperand> srcOps = inst.srcOperands;
             USILOperand textureOperand = srcOps[2];
+            SampleRef reference = ResolveSample(inst);
+            string tex = reference.FromResource ? reference.Tex : $"{srcOps[2]}";
             string value;
-            string args = $"{srcOps[2]}, {srcOps[0]}, {srcOps[3]}, {srcOps[4]}";
-            value = textureOperand.operandType switch
+            string args = $"{tex}, {srcOps[0]}, {srcOps[3]}, {srcOps[4]}";
+            // VRCW vrcw-6 (D2): a texture object has no tex2Dgrad; it samples with explicit gradients through
+            // its own sampler, or through the borrowed one. Derivative-sampled textures always keep a sampler.
+            if (reference.Separate)
             {
-                USILOperandType.Sampler2D => $"tex2Dgrad({args})",
-                USILOperandType.Sampler3D => $"tex3Dgrad({args})",
-                USILOperandType.SamplerCube => $"texCUBEgrad({args})",
-                _ => $"texNDgrad({args})" // unknown real type
-            };
+                value = $"{tex}.SampleGrad(sampler{reference.Owner}, {srcOps[0]}, {srcOps[3]}, {srcOps[4]})";
+            }
+            else if (GetRewrittenNames().Contains(textureOperand.metadataName ?? "") &&
+                reference.TexType is USILOperandType.Sampler2D or USILOperandType.Sampler3D or USILOperandType.SamplerCube)
+            {
+                value = $"{tex}.SampleGrad(sampler{tex}, {srcOps[0]}, {srcOps[3]}, {srcOps[4]})";
+            }
+            else
+            {
+                value = textureOperand.operandType switch
+                {
+                    USILOperandType.Sampler2D => $"tex2Dgrad({args})",
+                    USILOperandType.Sampler3D => $"tex3Dgrad({args})",
+                    USILOperandType.SamplerCube => $"texCUBEgrad({args})",
+                    _ => $"texNDgrad({args})" // unknown real type
+                };
+            }
             string comment = CommentString(inst);
             AppendLine($"{comment}{inst.destOperand} = {value};");
         }
+
 
         // The components of a loaded value the destination takes: the resource's swizzle, as many as the destination has.
         private static string Swizzle(USILOperand operand, USILOperand? destination)
@@ -756,28 +831,201 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             return _sampledNames;
         }
 
-        /// <summary>Named textures this program reads texel by texel (ld) or asks the size of, and never samples: they are Texture objects, not sampler2D.</summary>
-        public HashSet<string> GetTextureObjectNames()
-        {
-            HashSet<string> objects = new();
-            foreach (var (instruction, operand) in AllInstructionOperands())
-            {
-                if (!operand.metadataNameAssigned || string.IsNullOrEmpty(operand.metadataName) ||
-                    operand.operandType != USILOperandType.ResourceRegister || operand.bufferResource)
-                {
-                    continue;
-                }
+        private static bool IsNamedSampler(USILOperand operand) =>
+            operand.metadataNameAssigned && !string.IsNullOrEmpty(operand.metadataName) &&
+            operand.operandType is USILOperandType.Sampler2D or USILOperandType.Sampler3D or USILOperandType.SamplerCube
+                or USILOperandType.Sampler2DArray or USILOperandType.SamplerCubeArray;
 
-                if (instruction.instructionType == USILInstructionType.LoadResource || instruction.instructionType == USILInstructionType.LoadResourceMultisampled ||
-                    IsDimensionInfo(instruction))
+        // A sample instruction's sampler flag: Sample carries it at 3, the others at 4. SampleDerivative has none.
+        private static int SamplerFlagIndex(USILInstructionType type) => type switch
+        {
+            USILInstructionType.Sample => 3,
+            USILInstructionType.SampleComparison or USILInstructionType.SampleComparisonLODZero or USILInstructionType.SampleLOD => 4,
+            _ => -1,
+        };
+
+        private static bool IsNamedResource(USILOperand operand) =>
+            operand.metadataNameAssigned && !string.IsNullOrEmpty(operand.metadataName) &&
+            operand.operandType == USILOperandType.ResourceRegister && !operand.bufferResource;
+
+        private static bool IsSampleInstruction(USILInstruction instruction) =>
+            instruction.instructionType == USILInstructionType.Sample ||
+            instruction.instructionType == USILInstructionType.SampleComparison ||
+            instruction.instructionType == USILInstructionType.SampleComparisonLODZero ||
+            instruction.instructionType == USILInstructionType.SampleLOD ||
+            instruction.instructionType == USILInstructionType.SampleDerivative;
+
+        private static USILOperandType DimOperandType(int dim) => dim switch
+        {
+            3 => USILOperandType.Sampler3D,
+            4 => USILOperandType.SamplerCube,
+            5 => USILOperandType.Sampler2DArray,
+            6 => USILOperandType.SamplerCubeArray,
+            _ => USILOperandType.Sampler2D,
+        };
+
+        /// <summary>A sample's read texture and sampler (VRCW vrcw-6, D2).</summary>
+        private readonly record struct SampleRef(string Tex, string Owner, USILOperandType TexType, bool Separate, bool FromResource);
+
+        /// <summary>
+        /// Which texture a sample reads and whose sampler it uses (VRCW vrcw-6, D2). A sample whose resource and
+        /// sampler name different textures reads the resource with the sampler's state; otherwise the sampler names
+        /// the texture, as before. Falls back to the sampler when the resource is unnamed or its dimension unknown.
+        /// </summary>
+        private SampleRef ResolveSample(USILInstruction instruction)
+        {
+            USILOperand resource = instruction.srcOperands[1], sampler = instruction.srcOperands[2];
+            int flagIndex = SamplerFlagIndex(instruction.instructionType);
+            bool flag = flagIndex >= 0 && instruction.srcOperands.Count > flagIndex &&
+                instruction.srcOperands[flagIndex].immValueInt is { Length: > 0 } ints && ints[0] == 1;
+            if (!flag && IsNamedSampler(sampler) && IsNamedResource(resource) && resource.metadataName != sampler.metadataName
+                && _textureDims.TryGetValue(resource.metadataName!, out int dim))
+            {
+                return new SampleRef(resource.metadataName!, SamplerArgument(sampler), DimOperandType(dim), true, true);
+            }
+            return new SampleRef(sampler.metadataName ?? "", SamplerArgument(sampler), sampler.operandType, flag, false);
+        }
+
+        private Dictionary<string, USILOperandType>? _textureObjects;
+        private HashSet<string>? _loadedNames;
+        private HashSet<string>? _ownSampledNames;
+        private HashSet<string>? _samplerOwners;
+        private HashSet<string>? _rewrittenNames;
+
+        /// <summary>
+        /// Textures this program reads through a separate sampler (VRCW vrcw-6, D2), by name and read dimension:
+        /// declared as texture objects, not sampler2D.
+        /// </summary>
+        public Dictionary<string, USILOperandType> GetTextureObjects()
+        {
+            if (_textureObjects == null)
+            {
+                _textureObjects = new();
+                foreach (USILInstruction instruction in _shader.instructions)
                 {
-                    objects.Add(operand.metadataName!);
+                    if (!IsSampleInstruction(instruction) || instruction.srcOperands.Count < 3) continue;
+                    SampleRef reference = ResolveSample(instruction);
+                    if (reference.Separate && !USILSamplerTypeFixer.SHARED_SAMPLER_TEXTURE_NAMES.ContainsKey(reference.Tex)
+                        && !IsBuiltinTexture(reference.Tex))
+                        _textureObjects.TryAdd(reference.Tex, reference.TexType);
                 }
             }
 
-            objects.ExceptWith(SampledTextureNames());
-            return objects;
+            return _textureObjects;
         }
+
+        /// <summary>Textures this program reads texel by texel (ld) or asks the size of.</summary>
+        public HashSet<string> GetLoadedNames()
+        {
+            if (_loadedNames == null)
+            {
+                _loadedNames = new();
+                foreach (var (instruction, operand) in AllInstructionOperands())
+                {
+                    if (!IsNamedResource(operand)) continue;
+                    if (instruction.instructionType == USILInstructionType.LoadResource || instruction.instructionType == USILInstructionType.LoadResourceMultisampled ||
+                        IsDimensionInfo(instruction))
+                    {
+                        _loadedNames.Add(operand.metadataName!);
+                    }
+                }
+            }
+
+            return _loadedNames;
+        }
+        private Dictionary<string, USILOperandType>? _loadedTypes;
+
+        /// <summary>Load-only textures by read dimension (VRCW vrcw-6, D2): the ld address width tells
+        /// 2D (int3) from 2D-array (int4) apart when reflection names no sampler.</summary>
+        public Dictionary<string, USILOperandType> GetLoadedTypes()
+        {
+            if (_loadedTypes == null)
+            {
+                _loadedTypes = new(StringComparer.Ordinal);
+                foreach (USILInstruction instruction in _shader.instructions)
+                {
+                    if (instruction.instructionType != USILInstructionType.LoadResource &&
+                        instruction.instructionType != USILInstructionType.LoadResourceMultisampled) continue;
+                    if (instruction.srcOperands.Count < 2) continue;
+                    USILOperand resource = instruction.srcOperands[1];
+                    if (!IsNamedResource(resource)) continue;
+                    int width = 3;
+                    try { width = Math.Max(1, instruction.srcOperands[0].GetValueCount()); } catch { width = 3; }
+                    USILOperandType type = width >= 4 ? USILOperandType.Sampler2DArray : USILOperandType.Sampler2D;
+                    if (type == USILOperandType.Sampler2DArray) _loadedTypes[resource.metadataName!] = type;
+                    else _loadedTypes.TryAdd(resource.metadataName!, type);
+                }
+            }
+
+            return _loadedTypes;
+        }
+
+        /// <summary>
+        /// Textures this program also samples through their own sampler (VRCW vrcw-6, D2): they keep a sampler
+        /// declaration (through UNITY_DECLARE_TEX2D and the like) beside their texture object.
+        /// </summary>
+        public HashSet<string> GetOwnSampledNames()
+        {
+            if (_ownSampledNames == null)
+            {
+                _ownSampledNames = new();
+                foreach (USILInstruction instruction in _shader.instructions)
+                {
+                    if (!IsSampleInstruction(instruction) || instruction.srcOperands.Count < 3) continue;
+                    if (instruction.instructionType == USILInstructionType.SampleDerivative)
+                    {
+                        if (IsNamedSampler(instruction.srcOperands[2])) _ownSampledNames.Add(instruction.srcOperands[2].metadataName!);
+                        continue;
+                    }
+                    SampleRef reference = ResolveSample(instruction);
+                    if (!reference.Separate && IsNamedSampler(instruction.srcOperands[2])) _ownSampledNames.Add(instruction.srcOperands[2].metadataName!);
+                }
+            }
+
+            return _ownSampledNames;
+        }
+
+        /// <summary>
+        /// Sampler owners this program borrows (VRCW vrcw-6, D2): textures whose sampler state a separate sample
+        /// uses. Each keeps a sampler declaration so the borrowed sampler exists.
+        /// </summary>
+        public HashSet<string> GetSamplerOwners()
+        {
+            if (_samplerOwners == null)
+            {
+                _samplerOwners = new(StringComparer.Ordinal);
+                foreach (USILInstruction instruction in _shader.instructions)
+                {
+                    if (!IsSampleInstruction(instruction) || instruction.srcOperands.Count < 3) continue;
+                    SampleRef reference = ResolveSample(instruction);
+                    if (reference.Separate && reference.Owner != reference.Tex
+                        && !USILSamplerTypeFixer.SHARED_SAMPLER_TEXTURE_NAMES.ContainsKey(reference.Owner)
+                        && !IsBuiltinTexture(reference.Owner))
+                        _samplerOwners.Add(reference.Owner);
+                }
+            }
+
+            return _samplerOwners;
+        }
+
+        /// <summary>Textures whose own-sampler samples are written through UNITY_SAMPLE_* (D2).</summary>
+        public HashSet<string> GetRewrittenNames()
+        {
+            if (_rewrittenNames == null)
+            {
+                // Owners upgraded to UNITY_DECLARE_* need their own samples rewritten too (a texture object
+                // has no tex2D).
+                _rewrittenNames = new(GetOwnSampledNames(), StringComparer.Ordinal);
+                _rewrittenNames.IntersectWith(GetTextureObjects().Keys.Concat(GetLoadedNames()).Concat(GetSamplerOwners()));
+            }
+
+            return _rewrittenNames;
+        }
+
+        private static bool IsBuiltinTexture(string name) =>
+            UnityShaderConstants.BUILTIN_TEXTURE_NAMES.Contains(name);
+
+
 
         private static string TextureObjectType(int dimension) => dimension switch
         {
@@ -797,7 +1045,26 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
         /// Declarations for what the program reads and reflection does not name: a resource register (rsc0) and a constant buffer
         /// register (cb0), and the buffers reflection names as buffers. Names already in <paramref name="declared"/> are skipped.
         /// </summary>
-        public string WriteUnnamedDeclarations(HashSet<string> declared, int depth)
+        /// <summary>
+        /// Unnamed constant-buffer registers this program stores to (VRCW vrcw-6, fix 22): the compiled program
+        /// writes them (AudioLink's self-copy pass stores its previous frame into cb0/cb1). A cbuffer member
+        /// cannot be assigned, so the pass emits those registers as writable global arrays instead.
+        /// </summary>
+        public HashSet<int> GetUnnamedBufferWrites()
+        {
+            HashSet<int> writes = new();
+            foreach (USILInstruction instruction in _shader.instructions)
+            {
+                foreach (USILOperand operand in AllOperands(instruction.destOperand))
+                {
+                    if (operand.operandType == USILOperandType.ConstantBuffer && !operand.metadataNameAssigned)
+                        writes.Add(operand.registerIndex);
+                }
+            }
+            return writes;
+        }
+
+        public string WriteUnnamedDeclarations(HashSet<string> declared, int depth, Dictionary<int, int>? passConstantBuffers = null)
         {
             Dictionary<string, string> resources = new();
             Dictionary<int, (int Size, bool Relative)> constantBuffers = new();
@@ -830,31 +1097,17 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
                 else if (operand.operandType == USILOperandType.ConstantBuffer && !operand.metadataNameAssigned)
                 {
                     constantBuffers.TryGetValue(operand.registerIndex, out var known);
-                    int size = operand.arrayRelative != null ? 4096 : operand.arrayIndex + 1;
+                    int observed = operand.arrayRelative != null ? 4096 : operand.arrayIndex + 1;
+                    // The declared length wins only when it is the larger: a program can index past a shorter
+                    // declaration (AudioLink's self-copy stores into cb1 beyond its dcl_constantbuffer length).
+                    int size = _shader.constantBufferSizes.TryGetValue(operand.registerIndex, out int reflectedSize)
+                        ? Math.Max(reflectedSize, observed) : observed;
                     constantBuffers[operand.registerIndex] = (Math.Max(known.Size, size), known.Relative || operand.arrayRelative != null);
-                }
-            }
-
-            // The size of a texture that is also sampled comes from its _TexelSize vector (see HandleResourceDimensionInfo).
-            HashSet<string> texelSizes = new();
-            foreach (var (instruction, operand) in AllInstructionOperands())
-            {
-                if (IsDimensionInfo(instruction) && operand.operandType == USILOperandType.ResourceRegister && operand.metadataNameAssigned &&
-                    !operand.bufferResource && operand.metadataName != null && SampledTextureNames().Contains(operand.metadataName))
-                {
-                    texelSizes.Add(operand.metadataName);
                 }
             }
 
             StringBuilder sb = new();
             string indent = new string(' ', depth * 4);
-            foreach (string name in texelSizes.Order(StringComparer.Ordinal))
-            {
-                if (declared.Add(name + "_TexelSize"))
-                {
-                    sb.AppendLine($"{indent}float4 {name}_TexelSize; // the size of {name}, which is also sampled");
-                }
-            }
 
             foreach ((string name, string type) in resources.OrderBy(r => r.Key, StringComparer.Ordinal))
             {
@@ -866,13 +1119,41 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
 
             foreach ((int register, (int size, bool _)) in constantBuffers.OrderBy(c => c.Key))
             {
-                if (declared.Add($"cb{register}"))
+                if (passConstantBuffers != null)
+                {
+                    passConstantBuffers.TryGetValue(register, out int known);
+                    passConstantBuffers[register] = Math.Max(known, size);
+                }
+                else if (declared.Add($"cb{register}"))
                 {
                     sb.AppendLine($"{indent}float4 cb{register}[{size}]; // constant buffer {register}, no names in the shader's reflection data");
                 }
             }
 
             return sb.ToString();
+        }
+
+        /// <summary>Textures whose size is read and which are also sampled (VRCW): their _TexelSize
+        /// vector is ensured beside their declaration (see HandleResourceDimensionInfo).</summary>
+        private HashSet<string>? _texelSizeNames;
+        public HashSet<string> GetTexelSizeNames()
+        {
+            if (_texelSizeNames == null)
+            {
+                // The size of a texture that is also sampled comes from its _TexelSize vector (see HandleResourceDimensionInfo).
+                _texelSizeNames = new();
+                foreach (var (instruction, operand) in AllInstructionOperands())
+                {
+                    if (IsDimensionInfo(instruction) && operand.operandType == USILOperandType.ResourceRegister && operand.metadataNameAssigned &&
+                        !operand.bufferResource && operand.metadataName != null && SampledTextureNames().Contains(operand.metadataName))
+                    {
+                        if (!_textureDims.TryGetValue(operand.metadataName, out int dim) || dim is < 2 or > 6)
+                            _texelSizeNames.Add(operand.metadataName);
+                    }
+                }
+            }
+
+            return _texelSizeNames;
         }
 
         private void HandleDiscard(USILInstruction inst)
@@ -893,9 +1174,27 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             USILOperand usilDepthOrArraySize = srcOps[4];
             USILOperand usilMipCount = srcOps[5];
 
+            // _TexelSize cannot provide array length, volume depth or mip count. Keep the native
+            // resource query, with integer scratch outputs rather than casts used as out l-values.
+            if (!usilResource.bufferResource && usilResource.metadataName is string resourceName &&
+                _textureDims.TryGetValue(resourceName, out int dimension) && dimension is >= 2 and <= 6)
+            {
+                bool depth = dimension is 3 or 5 or 6;
+                string[] scratch = Enumerable.Range(0, depth ? 4 : 3).Select(_ => $"rscDimension{_scratchCount++}").ToArray();
+                AppendLine($"uint {string.Join(", ", scratch)};");
+                AppendLine($"{CommentString(inst)}{resourceName}.GetDimensions((uint)({usilMipLevel}), {string.Join(", ", scratch)});");
+                var outputs = depth ? new[] { usilWidth, usilHeight, usilDepthOrArraySize, usilMipCount }
+                    : new[] { usilWidth, usilHeight, usilMipCount };
+                for (int i = 0; i < outputs.Length; i++)
+                    if (outputs[i].operandType != USILOperandType.Null) AppendLine($"{outputs[i]} = {scratch[i]};");
+                return;
+            }
+
             // A sampled texture is a sampler2D, which has no GetDimensions; its _TexelSize vector holds (1/w, 1/h, w, h).
+            // A texture only loaded from has no sampler either; its _TexelSize vector (ensured beside its
+            // declaration) serves the same way.
             if (usilResource.metadataNameAssigned && !usilResource.bufferResource && usilResource.metadataName != null &&
-                SampledTextureNames().Contains(usilResource.metadataName))
+                (SampledTextureNames().Contains(usilResource.metadataName) || GetLoadedNames().Contains(usilResource.metadataName)))
             {
                 string texelSize = $"{usilResource.metadataName}_TexelSize";
                 string commentLine = CommentString(inst);
@@ -1042,8 +1341,11 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
         {
             // this can create bad optos and should be
             // replaced with USILXXXLoopOptimizer if possible.
+            // VRCW vrcw-6 (D1): a DXBC loop block means the original compiler kept a real loop, so [loop]
+            // restates what it did. Without it the shader compiler tries to unroll the loop and gives up
+            // (Popcorn's Lit: "unable to unroll loop, loop does not appear to terminate in a timely manner").
             string comment = CommentString(inst);
-            AppendLine($"{comment}while (true) {{");
+            AppendLine($"{comment}[loop] while (true) {{");
             _indentLevel++;
         }
 
@@ -1097,7 +1399,8 @@ namespace AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Functi
             };
 
             AppendLine(
-                $"{comment}for ({numberTypeName} {iterName} = {iterRegOp}; " +
+                // VRCW vrcw-6 (D1): as in HandleLoop, a real loop keeps [loop] so the compiler does not try to unroll it.
+                $"{comment}[loop] for ({numberTypeName} {iterName} = {iterRegOp}; " +
                 $"{iterName} {compText} {compOp}; " +
                 $"{iterName} += {addCount.ToString(CultureInfo.InvariantCulture)}) {{"
             );

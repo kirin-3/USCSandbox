@@ -1,11 +1,14 @@
-﻿using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.Converter;
+using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.Converter;
 using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.DirectX;
 using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.UShader.Function;
+using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL;
+using AssetRipper.Export.Modules.Shaders.UltraShaderConverter.USIL.Fixers;
 using AssetRipper.Primitives;
 using AssetsTools.NET;
 using AssetsTools.NET.Extra.Decompressors.LZ4;
 using System.Globalization;
 using System.Text;
+using System.Text.RegularExpressions;
 using USCSandbox.Extras;
 
 namespace USCSandbox.Processor
@@ -98,6 +101,13 @@ namespace USCSandbox.Processor
                 .ThenByDescending(x => x.subProg.GlobalKeywords.Concat(x.subProg.LocalKeywords).Count())
                 .ToList();
 
+            var passParams = basketsInfo.Select(basket =>
+            {
+                ShaderParams param = basket.index != -1 ? blobManager.GetShaderParams(basket.index) : basket.subProg.ShaderParams;
+                param.CombineCommon(basket.progInfo);
+                return param;
+            }).ToList();
+
             var subPrograms = basketsInfo.Select(x => x.subProg).ToList();
             // VRC recovery patch: SM5.0 programs (#pragma target 5.0) share the SM4.0 path.
             ShaderGpuProgramType[] vertTypes = [ShaderGpuProgramType.DX11VertexSM40, ShaderGpuProgramType.DX11VertexSM50, ShaderGpuProgramType.ConsoleVS];
@@ -179,14 +189,20 @@ namespace USCSandbox.Processor
                 .Select(x => String.Join("-", x.GlobalKeywords.Concat(x.LocalKeywords).Order()))
                 .Distinct()
                 .ToDictionary(x => x, _ => new HashSet<string>());
+
+            var customMembers = new HashSet<string>();
+            defineSb.Append(WritePassCustomCBuffers(passParams, customMembers, depth));
+            foreach (var declared in declaredCBufs.Values) declared.UnionWith(customMembers);
             
             var lastVertext = basketsInfo.LastOrDefault(x => vertTypes.Contains(x.subProg.GetProgramType(_engVer)));
             var lastFragment = basketsInfo.LastOrDefault(x => fragTypes.Contains(x.subProg.GetProgramType(_engVer)));
 
             bool noVertexVariants = subPrograms.Count(x => vertTypes.Contains(x.GetProgramType(_engVer))) <= 1;
             bool noFragmentVariants = subPrograms.Count(x => fragTypes.Contains(x.GetProgramType(_engVer))) <= 1;
-            
-            foreach (var basket in basketsInfo)
+            var unnamedBuffers = new Dictionary<int, int>();
+            var unnamedWrites = new HashSet<int>();
+
+            foreach (var (basket, param) in basketsInfo.Zip(passParams))
             {
                 var structSb = new StringBuilder();
                 var cbufferSb = new StringBuilder();
@@ -199,18 +215,6 @@ namespace USCSandbox.Processor
                 var index = basket.index;
 
                 var subProg = blobManager.GetShaderSubProgram((int)subProgInfo.BlobIndex);
-
-                ShaderParams param;
-                if (index != -1)
-                {
-                    param = blobManager.GetShaderParams(index);
-                }
-                else
-                {
-                    param = subProg.ShaderParams;
-                }
-                
-                param.CombineCommon(progInfo);
 
                 var programType = subProg.GetProgramType(_engVer);
                 // VRC recovery patch: decompile SM5.0 exactly like SM4.0 (same DXBC reader, SHEX chunk).
@@ -256,14 +260,17 @@ namespace USCSandbox.Processor
                     structSb.Append($"#{preprocessorDirective} {string.Join(" && ", keywords)} // {passName}:{programType}");
                 }
                 
+                int cbufSectionStart = cbufferSb.Length;
                 cbufferSb.Append(new string(' ', depth * 4));
                 cbufferSb.AppendLine($"// CBs for {programType}");
                 
                 foreach (ConstantBuffer cbuffer in param.ConstantBuffers)
                 {
-                    cbufferSb.Append(WritePassCBuffer(param, declaredCBufs[string.Join("-", keywords)], cbuffer, depth));
+                    if (cbuffer.Name == "$Globals" || DeclaredByUnityIncludes(cbuffer.Name))
+                        cbufferSb.Append(WritePassCBuffer(param, declaredCBufs[string.Join("-", keywords)], cbuffer, depth));
                 }
 
+                int texSectionStart = texSb.Length;
                 texSb.Append(new string(' ', depth * 4));
                 texSb.AppendLine($"// Textures for {programType}");
 
@@ -279,23 +286,34 @@ namespace USCSandbox.Processor
                         conv.ConvertDxShaderToUShaderProgram();
                         conv.ApplyMetadataToProgram(subProg, param, _engVer);
 
-                        UShaderFunctionToHLSL hlslConverter = new UShaderFunctionToHLSL(conv.ShaderProgram!, depth);
+                        UShaderFunctionToHLSL hlslConverter = new UShaderFunctionToHLSL(conv.ShaderProgram!, depth, param.TextureParameters);
 
-                        // Textures this program only calls methods on (Load, GetDimensions) are Texture objects; sampler2D has no methods.
-                        foreach (string loadedName in hlslConverter.GetTextureObjectNames())
-                        {
-                            texSb.Replace($"sampler2D {loadedName};", $"Texture2D<float4> {loadedName};");
-                            texSb.Replace($"sampler3D {loadedName};", $"Texture3D<float4> {loadedName};");
-                            texSb.Replace($"samplerCUBE {loadedName};", $"TextureCube<float4> {loadedName};");
-                        }
-                        texSb.Append(hlslConverter.WriteUnnamedDeclarations(declaredCBufs[string.Join("-", keywords)], depth));
+                        // VRCW vrcw-6 (D2): textures read through a separate sampler, and textures only loaded
+                        // from, are texture objects; sampler2D has no methods. One also sampled through its own
+                        // sampler keeps a sampler (UNITY_DECLARE_*), and borrowed samplers are declared too.
+                        var textureObjects = hlslConverter.GetTextureObjects();
+                        var rewritten = hlslConverter.GetRewrittenNames();
+                        var declaredHere = declaredCBufs[string.Join("-", keywords)];
+                        var loadedTypes = hlslConverter.GetLoadedTypes();
+                        foreach ((string name, USILOperandType type) in textureObjects)
+                            DeclareTextureObject(texSb, texSectionStart, cbufferSb, cbufSectionStart, name, type, rewritten.Contains(name), declaredHere, depth);
+                        foreach (string name in hlslConverter.GetLoadedNames())
+                            DeclareLoadedObject(texSb, texSectionStart, cbufferSb, cbufSectionStart, name, rewritten.Contains(name), loadedTypes.TryGetValue(name, out USILOperandType loadType) ? loadType : USILOperandType.Sampler2D, param.TextureParameters, declaredHere, depth);
+                        foreach (string owner in hlslConverter.GetSamplerOwners())
+                            EnsureSampler(texSb, texSectionStart, declaredHere, owner, depth, param.TextureParameters);
+
+                        texSb.Append(hlslConverter.WriteUnnamedDeclarations(declaredHere, depth, unnamedBuffers));
+                        unnamedWrites.UnionWith(hlslConverter.GetUnnamedBufferWrites());
+                        foreach (string texelName in hlslConverter.GetTexelSizeNames().Concat(hlslConverter.GetLoadedNames()))
+                            if (!customMembers.Contains(texelName + "_TexelSize"))
+                                EnsureTexelSize(texSb, texSectionStart, cbufferSb, cbufSectionStart, declaredHere, texelName, depth);
                         
                         structSb.AppendLine();
                         codeSb.AppendLine();
                         
                         structSb.Append(hlslConverter.WriteStruct());
                         structSb.AppendLine();
-                        codeSb.Append(hlslConverter.WriteFunction());
+                        codeSb.Append(hlslConverter.WriteFunction(retainVolumeSamplers: true));
 
                         break;
                     }
@@ -307,7 +325,7 @@ namespace USCSandbox.Processor
                         conv.ConvertNvnShaderToUShaderProgram(programType);
                         conv.ApplyMetadataToProgram(subProg, param, _engVer);
 
-                        UShaderFunctionToHLSL hlslConverter = new UShaderFunctionToHLSL(conv.ShaderProgram!, depth);
+                        UShaderFunctionToHLSL hlslConverter = new UShaderFunctionToHLSL(conv.ShaderProgram!, depth, param.TextureParameters);
                         if ((!encounterdVert && programType == ShaderGpuProgramType.ConsoleVS)
                             || (!encounterdFrag && programType == ShaderGpuProgramType.ConsoleFS))
                         {
@@ -339,11 +357,73 @@ namespace USCSandbox.Processor
                 passSb.AppendLine("#endif");
             }
 
+            foreach (var (register, size) in unnamedBuffers.OrderBy(b => b.Key))
+            {
+                string pad = new string(' ', depth * 4);
+                if (unnamedWrites.Contains(register))
+                {
+                    // The compiled program stores to this register (AudioLink's self-copy), and a cbuffer member
+                    // cannot be assigned: it stays a writable global array, as before the RawCB wrapper existed.
+                    defineSb.AppendLine($"{pad}float4 cb{register}[{size}]; // buffer {register} is written by the compiled program");
+                }
+                else
+                {
+                    defineSb.AppendLine($"{pad}CBUFFER_START(VRCRecovery_RawCB{register})");
+                    defineSb.AppendLine($"{pad}    float4 cb{register}[{size}]; // largest DXBC declaration in this pass");
+                    defineSb.AppendLine(pad + "CBUFFER_END");
+                }
+            }
             _sb.AppendNoIndent(defineSb.ToString());
             _sb.AppendNoIndent(passSb.ToString());
 
             _sb.AppendLine("ENDCG");
             _sb.AppendLine("");
+        }
+
+        private static List<ConstantBufferParameter> UnionParameters(IEnumerable<ConstantBufferParameter> parameters) =>
+            parameters.GroupBy(p => p.ParamName, StringComparer.Ordinal)
+                .Select(g => g.OrderByDescending(p => p.ArraySize).First())
+                .OrderBy(p => p.Index).ThenBy(p => p.ParamName, StringComparer.Ordinal).ToList();
+
+        private static string WritePassCustomCBuffers(IEnumerable<ShaderParams> programs, HashSet<string> declared, int depth)
+        {
+            var sb = new StringBuilder();
+            string pad = new string(' ', depth * 4);
+            foreach (var group in programs.SelectMany(p => p.ConstantBuffers)
+                .Where(c => c.Name != "$Globals" && !DeclaredByUnityIncludes(c.Name))
+                .GroupBy(c => c.Name, StringComparer.Ordinal))
+            {
+                var members = new List<(int Offset, string Text)>();
+                foreach (var param in UnionParameters(group.SelectMany(c => c.CBParams)))
+                {
+                    if (UnityShaderConstants.INCLUDED_UNITY_PROP_NAMES.Contains(param.ParamName) || !declared.Add(param.ParamName)) continue;
+                    string suffix = param.ArraySize > 0 ? $"[{param.ArraySize}]" : "";
+                    members.Add((param.Index, $"{pad}    {DXShaderNamingUtils.GetConstantBufferParamTypeName(param)} {param.ParamName}{suffix}; // {param.Index}"));
+                }
+                var structs = group.SelectMany(c => c.StructParams).GroupBy(s => s.Name, StringComparer.Ordinal).ToList();
+                foreach (var structure in structs)
+                {
+                    if (!declared.Add(structure.Key)) continue;
+                    var text = new StringBuilder();
+                    text.AppendLine(pad + "    struct {");
+                    foreach (var member in UnionParameters(structure.SelectMany(s => s.CBParams)))
+                    {
+                        string name = member.ParamName.StartsWith(structure.Key + ".", StringComparison.Ordinal)
+                            ? member.ParamName[(structure.Key.Length + 1)..] : member.ParamName;
+                        string suffix = member.ArraySize > 0 ? $"[{member.ArraySize}]" : "";
+                        text.AppendLine($"{pad}        {DXShaderNamingUtils.GetConstantBufferParamTypeName(member)} {name}{suffix};");
+                    }
+                    text.Append($"{pad}    }} {structure.Key}_Instances[{Math.Max(1, structure.Max(s => s.ArraySize))}];");
+                    members.Add((structure.Min(s => s.Index), text.ToString()));
+                }
+                if (members.Count == 0) continue;
+                sb.AppendLine($"{pad}CBUFFER_START({group.Key})");
+                foreach (var member in members.OrderBy(m => m.Offset)) sb.AppendLine(member.Text);
+                sb.AppendLine(pad + "CBUFFER_END");
+                foreach (var structure in structs)
+                    sb.AppendLine($"{pad}#define {structure.Key} {structure.Key}_Instances[0]");
+            }
+            return sb.ToString();
         }
 
         private string WritePassCBuffer(
@@ -457,6 +537,190 @@ namespace USCSandbox.Processor
         private static bool DeclaredByUnityIncludes(string cbufferName) =>
             UnityShaderConstants.BUILTIN_CBUFFER_NAMES.Contains(cbufferName);
 
+        // A pass body the decompiler did not write (VRCW vrcw-6, D3): VRCW's splice looks for this marker and
+        // records the stage as the pass's reason without a compile check.
+        public const string NotDecompiledMarker = "// VRCRecovery: not decompiled:";
+
+        private static string UnsupportedStageName(ShaderGpuProgramType type) => type switch
+        {
+            ShaderGpuProgramType.DX11GeometrySM40 or ShaderGpuProgramType.DX11GeometrySM50 => "geometry",
+            ShaderGpuProgramType.DX11HullSM50 => "hull",
+            ShaderGpuProgramType.DX11DomainSM50 => "domain",
+            _ => "",
+        };
+
+        /// <summary>
+        /// Why a pass keeps its generic body ("geometry stage", "hull and domain stages"), or null when every
+        /// program is a vertex or pixel program the decompiler reads.
+        /// </summary>
+        public static string? NotDecompiledReason(IEnumerable<ShaderGpuProgramType> programTypes)
+        {
+            List<string> stages = [];
+            foreach (string stage in new[] { "geometry", "hull", "domain" })
+            {
+                if (programTypes.Any(t => UnsupportedStageName(t) == stage))
+                    stages.Add(stage);
+            }
+            if (stages.Count == 0) return null;
+            if (stages.Count == 1) return stages[0] + " stage";
+            return string.Join(", ", stages[..^1]) + " and " + stages[^1] + " stages";
+        }
+
+        // The current program's own declarations: everything appended to texSb since its section started.
+        // "Is it declared" checks stay inside it, so one program never answers for another one's branch.
+        private static string SectionText(StringBuilder texSb, int sectionStart) =>
+            texSb.ToString(sectionStart, texSb.Length - sectionStart);
+
+        // A declaration line already written for the name, if any: appends replicate it verbatim,
+        // since only byte-identical duplicates are tolerated across branches.
+        private static string? FindBaseDecl(StringBuilder texSb, string name)
+        {
+            foreach (Match line in Regex.Matches(texSb.ToString(), @"^[ \\t]*(?:sampler2D|sampler3D|samplerCUBE|Texture2D<float4>|Texture3D<float4>|TextureCube<float4>|Texture2DArray<float4>|TextureCubeArray<float4>|UNITY_DECLARE_\\w+\\(\\w+\\));[^\\r\\n]*", RegexOptions.Multiline))
+            {
+                string text = line.Value.Trim();
+                if (text.Contains(name + ";") || text.Contains("(" + name + ")")) return text;
+            }
+            return null;
+        }
+
+        private static bool Declares(StringBuilder texSb, int sectionStart, string name) =>
+            SectionText(texSb, sectionStart).Contains(name + ";") || SectionText(texSb, sectionStart).Contains("(" + name + ")");
+
+        // Upgrades base declarations inside this program's section only: a global replace would
+        // upgrade other programs' branches, whose uses may still need the sampler form.
+        private static void ReplaceInSection(StringBuilder texSb, int sectionStart, string oldText, string newText)
+        {
+            if (oldText == newText) return;
+            string head = texSb.ToString(0, sectionStart);
+            string tail = SectionText(texSb, sectionStart).Replace(oldText, newText);
+            texSb.Length = 0;
+            texSb.Append(head);
+            texSb.Append(tail);
+        }
+
+        // Declares a texture object for a texture read through a separate sampler (VRCW vrcw-6, D2).
+        // Reflection names no sampler for load-only textures, so there may be nothing to upgrade:
+        // then the declaration is appended, or sampling and loading it fails.
+        private static void DeclareTextureObject(StringBuilder texSb, int sectionStart, StringBuilder cbufferSb, int cbufSectionStart, string name, USILOperandType type, bool keepSampler, HashSet<string> declared, int depth)
+        {
+            // Built-ins are declared by Unity's includes; touching them redefines them.
+            if (UnityShaderConstants.BUILTIN_TEXTURE_NAMES.Contains(name)) return;
+            if (type == USILOperandType.Sampler2DArray || type == USILOperandType.SamplerCubeArray)
+            {
+                if (!Declares(texSb, sectionStart, name))
+                    texSb.AppendLine(new string(' ', depth * 4) + (type == USILOperandType.Sampler2DArray ? $"UNITY_DECLARE_TEX2DARRAY({name});" : $"UNITY_DECLARE_TEXCUBEARRAY({name});"));
+                declared.Add(name);
+                return; // UNITY_DECLARE_TEX*_ARRAY already makes texture objects.
+            }
+            (string Sampler, string Object, string Declare) = type switch
+            {
+                USILOperandType.Sampler3D => ("sampler3D", "Texture3D<float4>", "UNITY_DECLARE_TEX3D"),
+                USILOperandType.SamplerCube => ("samplerCUBE", "TextureCube<float4>", "UNITY_DECLARE_TEXCUBE"),
+                _ => ("sampler2D", "Texture2D<float4>", "UNITY_DECLARE_TEX2D"),
+            };
+            ReplaceInSection(texSb, sectionStart, $"{Sampler} {name};", keepSampler ? $"{Declare}({name});" : $"{Object} {name};");
+            if (keepSampler) ReplaceInSection(texSb, sectionStart, $"{Object} {name};", $"{Declare}({name});");
+            if (!Declares(texSb, sectionStart, name) && !MemberOf(cbufferSb, cbufSectionStart, name))
+            {
+                string? model = FindBaseDecl(texSb, name);
+                string wanted = keepSampler ? $"{Declare}({name});" : $"{Object} {name};";
+                if (model != null && NormDecl(model) == NormDecl(wanted)) wanted = model;
+                texSb.AppendLine(new string(' ', depth * 4) + wanted);
+            }
+            declared.Add(name);
+        }
+
+        // Declares a texture object for a texture only loaded from (VRCW: as before, plus UNITY_DECLARE_*
+        // when its own sampler samples it too, so tex2D and .Load both compile). The dimension comes from
+        // reflection when it names a sampler, else from the ld address width.
+        private static void DeclareLoadedObject(StringBuilder texSb, int sectionStart, StringBuilder cbufferSb, int cbufSectionStart, string name, bool keepSampler, USILOperandType loadType, List<TextureParameter> textureParams, HashSet<string> declared, int depth)
+        {
+            // Built-ins are declared by Unity's includes; touching them redefines them.
+            if (UnityShaderConstants.BUILTIN_TEXTURE_NAMES.Contains(name)) return;
+            string dimension = textureParams.FirstOrDefault(param => param.Name == name)?.Dim switch
+            {
+                3 => "3D",
+                4 => "CUBE",
+                5 => "2DARRAY",
+                6 => "CUBEARRAY",
+                _ => loadType == USILOperandType.Sampler2DArray ? "2DARRAY" : "2D",
+            };
+            string bare = dimension switch
+            {
+                "3D" => "Texture3D<float4>",
+                "CUBE" => "TextureCube<float4>",
+                "2DARRAY" => "Texture2DArray<float4>",
+                "CUBEARRAY" => "TextureCubeArray<float4>",
+                _ => "Texture2D<float4>",
+            };
+            string declare = "UNITY_DECLARE_TEX" + dimension;
+            foreach (var (sampler, bareForm, declareForm) in new[] { ("sampler2D", "Texture2D<float4>", "UNITY_DECLARE_TEX2D"), ("sampler3D", "Texture3D<float4>", "UNITY_DECLARE_TEX3D"), ("samplerCUBE", "TextureCube<float4>", "UNITY_DECLARE_TEXCUBE") })
+            {
+                ReplaceInSection(texSb, sectionStart, $"{sampler} {name};", keepSampler ? $"{declareForm}({name});" : $"{bareForm} {name};");
+                if (keepSampler) ReplaceInSection(texSb, sectionStart, $"{bareForm} {name};", $"{declareForm}({name});");
+            }
+            if (!Declares(texSb, sectionStart, name) && !MemberOf(cbufferSb, cbufSectionStart, name))
+            {
+                string? model = FindBaseDecl(texSb, name);
+                string wanted = keepSampler ? $"{declare}({name});" : $"{bare} {name};";
+                if (model != null && NormDecl(model) == NormDecl(wanted)) wanted = model;
+                texSb.AppendLine(new string(' ', depth * 4) + wanted);
+            }
+            declared.Add(name);
+        }
+
+        // Pairs a borrowed sampler with its texture (VRCW vrcw-6, D2): sampling through another texture's
+        // sampler needs SamplerState sampler<owner>, which only a UNITY_DECLARE_* declaration makes beside its
+        // texture object. A bare SamplerState line without its texture does not compile. Upgrades the owner's
+        // declaration, or appends one when it has none.
+        private static void EnsureSampler(StringBuilder texSb, int sectionStart, HashSet<string> declared, string owner, int depth, List<TextureParameter> textureParams)
+        {
+            // Another program with the same keywords may have marked the set from its own section;
+            // upgrades below stay inside this section, so every program is consistent on its own.
+            declared.Add("sampler " + owner);
+            string declare = textureParams.FirstOrDefault(p => p.Name == owner)?.Dim switch
+            {
+                3 => "UNITY_DECLARE_TEX3D",
+                4 => "UNITY_DECLARE_TEXCUBE",
+                5 => "UNITY_DECLARE_TEX2DARRAY",
+                6 => "UNITY_DECLARE_TEXCUBEARRAY",
+                _ => "UNITY_DECLARE_TEX2D",
+            };
+            foreach (string sampler in new[] { "sampler2D", "sampler3D", "samplerCUBE", "Texture2D<float4>", "Texture3D<float4>", "TextureCube<float4>" })
+            {
+                ReplaceInSection(texSb, sectionStart, $"{sampler} {owner};", $"{declare}({owner});");
+            }
+            // A match elsewhere is another program's branch: this one still needs its own declaration.
+            if (!Declares(texSb, sectionStart, owner))
+            {
+                string? model = FindBaseDecl(texSb, owner);
+                string wanted = $"{declare}({owner});";
+                if (model != null && NormDecl(model) == NormDecl(wanted)) wanted = model;
+                texSb.AppendLine(new string(' ', depth * 4) + wanted);
+            }
+            declared.Add(owner);
+        }
+
+        // A declaration's core without indentation: same core means the same declaration.
+        private static string NormDecl(string line) => Regex.Replace(line.Trim(), @"\s*//.*$", "");
+
+        // A cbuffer member in this program's section: appending a texture declaration for the same
+        // name would redefine it.
+        private static bool MemberOf(StringBuilder cbufferSb, int cbufSectionStart, string name) =>
+            cbufferSb.ToString(cbufSectionStart, cbufferSb.Length - cbufSectionStart).Contains(name + ";");
+
+        // Declares the _TexelSize vector a GetDimensions rewrite reads (VRCW vrcw-6, D2): the shader's own
+        // cbuffer may already hold it, and each program branch needs its own line.
+        private static void EnsureTexelSize(StringBuilder texSb, int sectionStart, StringBuilder cbufferSb, int cbufSectionStart, HashSet<string> declared, string name, int depth)
+        {
+            // No built-in guard here: Unity declares no _TexelSize vector for its built-ins, so the
+            // member this appends is their only declaration (see 5ka's unity_Lightmap use).
+            string member = name + "_TexelSize";
+            string ownTex = SectionText(texSb, sectionStart), ownCbuf = cbufferSb.ToString(cbufSectionStart, cbufferSb.Length - cbufSectionStart);
+            declared.Add(name + "_TexelSize");
+            if (ownTex.Contains(member) || ownCbuf.Contains(member)) return;
+            texSb.AppendLine(new string(' ', depth * 4) + $"float4 {member}; // the size of {name}");
+        }
         private string WritePassTextures(
             ShaderParams shaderParams, HashSet<string> declaredCBufs, int depth)
         {
@@ -657,7 +921,19 @@ namespace USCSandbox.Processor
                         baskets.Add(new ShaderProgramBasket(fragInfo, fragProgInfos[i],
                             fragInfo.ParameterBlobIndices.Count > 0 ? (int)fragInfo.ParameterBlobIndices[i] : -1));
                     }
-                    if (baskets.Count > 0)
+                    // VRCW vrcw-6 (D3): a pass with geometry, hull or domain programs is not decompiled. The marker
+                    // keeps the generic body, and VRCW's splice records the stage as the reason without a compile check.
+                    var unsupportedTypes = new[] { "progGeometry", "progHull", "progDomain" }
+                        .SelectMany(stage => new SerializedProgramInfo(pass[stage], nameTable).SubProgramInfos)
+                        .Select(spi => blobManager.GetShaderSubProgram((int)spi.BlobIndex).GetProgramType(_engVer))
+                        .ToList();
+                    if (NotDecompiledReason(unsupportedTypes) is string notDecompiled)
+                    {
+                        _sb.AppendLine("CGPROGRAM");
+                        _sb.AppendLine(new string(' ', (_sb.GetIndent() + 1) * 4) + NotDecompiledMarker + " " + notDecompiled);
+                        _sb.AppendLine("ENDCG");
+                    }
+                    else if (baskets.Count > 0)
                         WritePassBody(blobManager, baskets, _sb.GetIndent(), passName);
                 }
                 _sb.Unindent();
