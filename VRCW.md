@@ -85,6 +85,8 @@ Release `vrcw-6` was measured on a paired harness over seven worlds' shader sets
 
 The full Popcorn recovery also exposes a deliberate consequence of fix 21 outside that paired selection: `RED_SIM/Fire` previously compiled two vertex/fragment-only passes even though its programs include hull and domain stages. Those passes now keep generic bodies with an explicit unsupported-stage reason, and one material moves from decompiled to reconstructed. The selected-set no-loss result does not cover this Fire loss; it must be considered separately when approving the release.
 
+DEV's full recovery report gains all twelve AudioLink passes against the October 14 baseline, but loses `Hidden/ltspass_opaque` pass 0.4 on an unrecognized `sampler_udonpointlightvolumetexture`. That shader has zero world materials. It is outside the selected paired harness; this comparison does not establish whether the diagnostic first appeared in vrcw-5 or vrcw-6. DEV's material tiers and 1397 attached Udon records remain unchanged.
+
 ## Build
 
 Release `vrcw-1` was built on Windows with the .NET SDK 10.0.302, from a fresh clone of tag `vrcw-1`:
